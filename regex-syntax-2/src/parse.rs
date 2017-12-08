@@ -1276,19 +1276,21 @@ impl Parser {
                 c: c,
             }));
         }
-        let special = |c| Ok(Primitive::Literal(AstLiteral {
+        let special = |kind, c| Ok(Primitive::Literal(AstLiteral {
             span: span,
-            kind: AstLiteralKind::Special,
+            kind: AstLiteralKind::Special(kind),
             c: c,
         }));
         match c {
-            'a' => special('\x07'),
-            'f' => special('\x0C'),
-            't' => special('\t'),
-            'n' => special('\n'),
-            'r' => special('\r'),
-            'v' => special('\x0B'),
-            ' ' if self.ignore_space() => special(' '),
+            'a' => special(AstSpecialLiteralKind::Bell, '\x07'),
+            'f' => special(AstSpecialLiteralKind::FormFeed, '\x0C'),
+            't' => special(AstSpecialLiteralKind::Tab, '\t'),
+            'n' => special(AstSpecialLiteralKind::LineFeed, '\n'),
+            'r' => special(AstSpecialLiteralKind::CarriageReturn, '\r'),
+            'v' => special(AstSpecialLiteralKind::VerticalTab, '\x0B'),
+            ' ' if self.ignore_space() => {
+                special(AstSpecialLiteralKind::Space, ' ')
+            }
             'A' => Ok(Primitive::Assertion(AstAssertion {
                 span: span,
                 kind: AstAssertionKind::StartText,
@@ -2363,7 +2365,8 @@ bar
                 flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
                 Ast::Literal(AstLiteral {
                     span: span_range(pat, 4..6),
-                    kind: AstLiteralKind::Special,
+                    kind: AstLiteralKind::Special(
+                        AstSpecialLiteralKind::Space),
                     c: ' ',
                 }),
             ])));
@@ -3201,15 +3204,19 @@ bar
                 c: '|',
             })));
         let specials = &[
-            (r"\a", '\x07'), (r"\f", '\x0C'), (r"\t", '\t'),
-            (r"\n", '\n'), (r"\r", '\r'), (r"\v", '\x0B'),
+            (r"\a", '\x07', AstSpecialLiteralKind::Bell),
+            (r"\f", '\x0C', AstSpecialLiteralKind::FormFeed),
+            (r"\t", '\t', AstSpecialLiteralKind::Tab),
+            (r"\n", '\n', AstSpecialLiteralKind::LineFeed),
+            (r"\r", '\r', AstSpecialLiteralKind::CarriageReturn),
+            (r"\v", '\x0B', AstSpecialLiteralKind::VerticalTab),
         ];
-        for &(pat, c) in specials {
+        for &(pat, c, ref kind) in specials {
             assert_eq!(
                 parser(pat).parse_primitive(),
                 Ok(Primitive::Literal(AstLiteral {
                     span: span(0..2),
-                    kind: AstLiteralKind::Special,
+                    kind: AstLiteralKind::Special(kind.clone()),
                     c: c,
                 })));
         }

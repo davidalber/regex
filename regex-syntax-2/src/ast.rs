@@ -482,19 +482,7 @@ impl fmt::Display for AstLiteral {
 
         match self.kind {
             Verbatim => self.c.fmt(f),
-            Special => {
-                // TODO: Get rid of the unreachable here by converting
-                // `Special` into an enum.
-                match self.c {
-                    '\x07' => r"\a".fmt(f),
-                    '\x0C' => r"\f".fmt(f),
-                    '\t' => r"\t".fmt(f),
-                    '\n' => r"\n".fmt(f),
-                    '\r' => r"\r".fmt(f),
-                    '\x0B' => r"\v".fmt(f),
-                    _ => unreachable!(),
-                }
-            }
+            Special(ref x) => x.fmt(f),
             Punctuation => write!(f, r"\{}", self.c),
             Octal => write!(f, r"\{:o}", self.c as u32),
             HexFixed(AstHexLiteralKind::X) => {
@@ -526,7 +514,7 @@ pub enum AstLiteralKind {
     Verbatim,
     /// The literal is written as a specially recognized escape, e.g., `\f`
     /// or `\n`.
-    Special,
+    Special(AstSpecialLiteralKind),
     /// The literal is written as an escape because it is punctuation, e.g.,
     /// `\*` or `\[`.
     Punctuation,
@@ -540,6 +528,45 @@ pub enum AstLiteralKind {
     /// digits. The only restriction is that the bracketed hex code must refer
     /// to a valid Unicode scalar value.
     HexBrace(AstHexLiteralKind),
+}
+
+/// The type of a special literal.
+///
+/// A special literal is a special escape sequence recognized by the regex
+/// parser, e.g., `\f` or `\n`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AstSpecialLiteralKind {
+    /// Bell, spelled `\a` (`\x07`).
+    Bell,
+    /// Form feed, spelled `\f` (`\x0C`).
+    FormFeed,
+    /// Tab, spelled `\t` (`\x09`).
+    Tab,
+    /// Line feed, spelled `\n` (`\x0A`).
+    LineFeed,
+    /// Carriage return, spelled `\r` (`\x0D`).
+    CarriageReturn,
+    /// Vertical tab, spelled `\v` (`\x0B`).
+    VerticalTab,
+    /// Space, spelled `\ ` (`\x20`). Note that this can only appear when
+    /// parsing in verbose mode.
+    Space,
+}
+
+impl fmt::Display for AstSpecialLiteralKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::AstSpecialLiteralKind::*;
+
+        match *self {
+            Bell => r"\a".fmt(f),
+            FormFeed => r"\f".fmt(f),
+            Tab => r"\t".fmt(f),
+            LineFeed => r"\n".fmt(f),
+            CarriageReturn => r"\r".fmt(f),
+            VerticalTab => r"\v".fmt(f),
+            Space => r"\ ".fmt(f),
+        }
+    }
 }
 
 /// The type of a Unicode hex literal.
@@ -1437,7 +1464,6 @@ mod tests {
     #[test]
     fn print_literal() {
         roundtrip("a");
-        roundtrip(r"\n");
         roundtrip(r"\[");
         roundtrip_with(|b| b.octal(true), r"\141");
         roundtrip(r"\x61");
@@ -1448,6 +1474,14 @@ mod tests {
         roundtrip(r"\x{7F}");
         roundtrip(r"\u{61}");
         roundtrip(r"\U{61}");
+
+        roundtrip(r"\a");
+        roundtrip(r"\f");
+        roundtrip(r"\t");
+        roundtrip(r"\n");
+        roundtrip(r"\r");
+        roundtrip(r"\v");
+        roundtrip(r"(?x)\ ");
     }
 
     #[test]
