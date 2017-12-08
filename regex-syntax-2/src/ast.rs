@@ -578,8 +578,6 @@ impl AstHexLiteralKind {
 pub enum AstClass {
     /// A perl character class, e.g., `\d` or `\W`.
     Perl(AstClassPerl),
-    /// An ASCII character class, e.g., `[[:alnum:]]` or `[[:punct:]]`.
-    Ascii(AstClassAscii),
     /// A Unicode character class, e.g., `\pL` or `\p{Greek}`.
     Unicode(AstClassUnicode),
     /// A character class set, which may contain zero or more character ranges
@@ -592,7 +590,6 @@ impl AstClass {
     pub fn span(&self) -> &Span {
         match *self {
             AstClass::Perl(ref x) => &x.span,
-            AstClass::Ascii(ref x) => &x.span,
             AstClass::Unicode(ref x) => &x.span,
             AstClass::Set(ref x) => &x.span,
         }
@@ -603,7 +600,6 @@ impl fmt::Display for AstClass {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             AstClass::Perl(ref x) => x.fmt(f),
-            AstClass::Ascii(ref x) => x.fmt(f),
             AstClass::Unicode(ref x) => x.fmt(f),
             AstClass::Set(ref x) => x.fmt(f),
         }
@@ -967,6 +963,8 @@ pub enum AstClassSetItem {
     Literal(AstLiteral),
     /// A range between two literals.
     Range(AstClassSetRange),
+    /// An ASCII character class, e.g., `[:alnum:]` or `[:punct:]`.
+    Ascii(AstClassAscii),
     /// A nested character class.
     Class(Box<AstClass>),
 }
@@ -977,6 +975,7 @@ impl AstClassSetItem {
         match *self {
             AstClassSetItem::Literal(ref x) => &x.span,
             AstClassSetItem::Range(ref x) => &x.span,
+            AstClassSetItem::Ascii(ref x) => &x.span,
             AstClassSetItem::Class(ref x) => x.span(),
         }
     }
@@ -987,6 +986,7 @@ impl fmt::Display for AstClassSetItem {
         match *self {
             AstClassSetItem::Literal(ref x) => x.fmt(f),
             AstClassSetItem::Range(ref x) => x.fmt(f),
+            AstClassSetItem::Ascii(ref x) => x.fmt(f),
             AstClassSetItem::Class(ref x) => x.fmt(f),
         }
     }

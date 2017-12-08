@@ -1531,8 +1531,7 @@ impl Parser {
                     // backs up to `[`.
                     if !self.stack_class.borrow().is_empty() {
                         if let Some(cls) = self.maybe_parse_ascii_class() {
-                            let cls = AstClass::Ascii(cls);
-                            union.push(AstClassSetItem::Class(Box::new(cls)));
+                            union.push(AstClassSetItem::Ascii(cls));
                             continue;
                         }
                     }
@@ -1923,7 +1922,6 @@ fn error_if_nested_class(
     }
     match *class {
         AstClass::Perl(_)
-        | AstClass::Ascii(_)
         | AstClass::Unicode(_) => Ok(()),
         AstClass::Set(AstClassSet { ref op, .. }) => {
             error_if_nested_class_op(op, limit, depth)
@@ -1947,7 +1945,8 @@ fn error_if_nested_class_op(
             for item in items {
                 match *item {
                     AstClassSetItem::Literal(_)
-                    | AstClassSetItem::Range(_) => {}
+                    | AstClassSetItem::Range(_)
+                    | AstClassSetItem::Ascii(_) => {}
                     AstClassSetItem::Class(ref cls) => {
                         let depth = depth.checked_add(1).unwrap();
                         try!(error_if_nested_class(cls, limit, depth));
@@ -3614,6 +3613,10 @@ bar
             AstClassSetItem::Class(Box::new(cls))
         }
 
+        fn item_ascii(cls: AstClassAscii) -> AstClassSetItem {
+            AstClassSetItem::Ascii(cls)
+        }
+
         fn lit(span: Span, c: char) -> AstClassSetItem {
             AstClassSetItem::Literal(AstLiteral {
                 span: span,
@@ -3648,20 +3651,37 @@ bar
             })
         }
 
-        fn alnum(span: Span, negated: bool) -> AstClass {
-            AstClass::Ascii(AstClassAscii {
+        fn alnum(span: Span, negated: bool) -> AstClassAscii {
+            AstClassAscii {
                 span: span,
                 kind: AstClassAsciiKind::Alnum,
                 negated: negated,
-            })
+            }
         }
 
-        fn lower(span: Span, negated: bool) -> AstClass {
-            AstClass::Ascii(AstClassAscii {
+        /*
+        fn alnum(span: Span, negated: bool) -> AstClass {
+            AstClass::Set(AstClassSet {
+                span: span,
+                negated: negated,
+                op: AstClassSetOp::Union(AstClassSetUnion {
+                    span: span,
+                    items: vec![AstClassSetItem::Ascii(AstClassAscii {
+                        span: span,
+                        kind: AstClassAsciiKind::Alnum,
+                        negated: negated,
+                    })],
+                }),
+            })
+        }
+        */
+
+        fn lower(span: Span, negated: bool) -> AstClassAscii {
+            AstClassAscii {
                 span: span,
                 kind: AstClassAsciiKind::Lower,
                 negated: negated,
-            })
+            }
         }
 
         assert_eq!(
@@ -3670,7 +3690,7 @@ bar
                 span: span(0..11),
                 negated: false,
                 op: union(span(1..10), vec![
-                    item(alnum(span(1..10), false)),
+                    item_ascii(alnum(span(1..10), false)),
                 ]),
             }))));
         assert_eq!(
@@ -3683,7 +3703,7 @@ bar
                         span: span(1..12),
                         negated: false,
                         op: union(span(2..11), vec![
-                            item(alnum(span(2..11), false)),
+                            item_ascii(alnum(span(2..11), false)),
                         ]),
                     })),
                 ]),
@@ -3695,8 +3715,12 @@ bar
                 negated: false,
                 op: intersection(
                     span(1..21),
-                    union(span(1..10), vec![item(alnum(span(1..10), false))]),
-                    union(span(12..21), vec![item(lower(span(12..21), false))])
+                    union(span(1..10), vec![
+                        item_ascii(alnum(span(1..10), false)),
+                    ]),
+                    union(span(12..21), vec![
+                        item_ascii(lower(span(12..21), false)),
+                    ])
                 ),
             }))));
         assert_eq!(
@@ -3706,8 +3730,12 @@ bar
                 negated: false,
                 op: difference(
                     span(1..21),
-                    union(span(1..10), vec![item(alnum(span(1..10), false))]),
-                    union(span(12..21), vec![item(lower(span(12..21), false))])
+                    union(span(1..10), vec![
+                        item_ascii(alnum(span(1..10), false)),
+                    ]),
+                    union(span(12..21), vec![
+                        item_ascii(lower(span(12..21), false)),
+                    ])
                 ),
             }))));
         assert_eq!(
@@ -3717,8 +3745,12 @@ bar
                 negated: false,
                 op: symdifference(
                     span(1..21),
-                    union(span(1..10), vec![item(alnum(span(1..10), false))]),
-                    union(span(12..21), vec![item(lower(span(12..21), false))])
+                    union(span(1..10), vec![
+                        item_ascii(alnum(span(1..10), false)),
+                    ]),
+                    union(span(12..21), vec![
+                        item_ascii(lower(span(12..21), false)),
+                    ])
                 ),
             }))));
 
