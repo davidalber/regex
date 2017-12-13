@@ -19,16 +19,16 @@ use std::fmt;
 /// valid Unicode property name. That particular error is reported when
 /// translating an AST to the high-level intermediate representation (`HIR`).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstError {
+pub struct Error {
     /// The span of this error.
     pub span: Span,
     /// The kind of error.
-    pub kind: AstErrorKind,
+    pub kind: ErrorKind,
 }
 
 /// The type of an error that occurred while building an AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstErrorKind {
+pub enum ErrorKind {
     /// An invalid escape sequence was found in a character class set.
     ClassIllegal,
     /// An opening `[` was found with no corresponding closing `]`.
@@ -111,9 +111,9 @@ pub enum AstErrorKind {
     UnsupportedLookAround,
 }
 
-impl error::Error for AstError {
+impl error::Error for Error {
     fn description(&self) -> &str {
-        use self::AstErrorKind::*;
+        use self::ErrorKind::*;
         match self.kind {
             ClassIllegal => "illegal item found in character class",
             ClassUnclosed => "unclosed character class",
@@ -142,9 +142,9 @@ impl error::Error for AstError {
     }
 }
 
-impl fmt::Display for AstError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstErrorKind::*;
+        use self::ErrorKind::*;
         match self.kind {
             ClassIllegal => {
                 write!(f, "illegal item found in character class")
@@ -309,11 +309,11 @@ impl Position {
 /// comment contains a span of precisely where it occurred in the original
 /// regular expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstWithComments {
+pub struct WithComments {
     /// The actual ast.
     pub ast: Ast,
     /// All comments found in the original regular expression.
-    pub comments: Vec<AstComment>,
+    pub comments: Vec<Comment>,
 }
 
 /// A comment from a regular expression with an associated span.
@@ -321,7 +321,7 @@ pub struct AstWithComments {
 /// A regular expression can only contain comments when the `x` flag is
 /// enabled.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstComment {
+pub struct Comment {
     /// The span of this comment, including the beginning `#` and ending `\n`.
     pub span: Span,
     /// The comment text, starting with the first character following the `#`
@@ -335,24 +335,24 @@ pub enum Ast {
     /// An empty regex that matches everything.
     Empty(Span),
     /// A set of flags, e.g., `(?is)`.
-    Flags(AstSetFlags),
+    Flags(SetFlags),
     /// A single character literal, which includes escape sequences.
-    Literal(AstLiteral),
+    Literal(Literal),
     /// The "any character" class.
     Dot(Span),
     /// A single zero-width assertion.
-    Assertion(AstAssertion),
+    Assertion(Assertion),
     /// A single character class. This includes all forms of character classes
     /// except for `.`. e.g., `\d`, `\pN`, `[a-z]` and `[[:alpha:]]`.
-    Class(AstClass),
+    Class(Class),
     /// A repetition operator applied to an arbitrary regular expression.
-    Repetition(AstRepetition),
+    Repetition(Repetition),
     /// A grouped regular expression.
-    Group(AstGroup),
+    Group(Group),
     /// An alternation of regular expressions.
-    Alternation(AstAlternation),
+    Alternation(Alternation),
     /// A concatenation of regular expressions.
-    Concat(AstConcat),
+    Concat(Concat),
 }
 
 impl Ast {
@@ -392,14 +392,14 @@ impl fmt::Display for Ast {
 
 /// An alternation of regular expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstAlternation {
+pub struct Alternation {
     /// The span of this alternation.
     pub span: Span,
     /// The alternate regular expressions.
     pub asts: Vec<Ast>,
 }
 
-impl AstAlternation {
+impl Alternation {
     /// Return this alternation as an AST.
     ///
     /// If this alternation contains zero ASTs, then Ast::Empty is
@@ -414,7 +414,7 @@ impl AstAlternation {
     }
 }
 
-impl fmt::Display for AstAlternation {
+impl fmt::Display for Alternation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut first = true;
         for x in &self.asts {
@@ -430,14 +430,14 @@ impl fmt::Display for AstAlternation {
 
 /// A concatenation of regular expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstConcat {
+pub struct Concat {
     /// The span of this concatenation.
     pub span: Span,
     /// The concatenation regular expressions.
     pub asts: Vec<Ast>,
 }
 
-impl AstConcat {
+impl Concat {
     /// Return this concatenation as an AST.
     ///
     /// If this concatenation contains zero ASTs, then Ast::Empty is
@@ -452,7 +452,7 @@ impl AstConcat {
     }
 }
 
-impl fmt::Display for AstConcat {
+impl fmt::Display for Concat {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for x in &self.asts {
             try!(x.fmt(f));
@@ -467,40 +467,40 @@ impl fmt::Display for AstConcat {
 /// represented in their literal form, e.g., `a` or in their escaped form,
 /// e.g., `\x61`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstLiteral {
+pub struct Literal {
     /// The span of this literal.
     pub span: Span,
     /// The kind of this literal.
-    pub kind: AstLiteralKind,
+    pub kind: LiteralKind,
     /// The Unicode scalar value corresponding to this literal.
     pub c: char,
 }
 
-impl fmt::Display for AstLiteral {
+impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstLiteralKind::*;
+        use self::LiteralKind::*;
 
         match self.kind {
             Verbatim => self.c.fmt(f),
             Special(ref x) => x.fmt(f),
             Punctuation => write!(f, r"\{}", self.c),
             Octal => write!(f, r"\{:o}", self.c as u32),
-            HexFixed(AstHexLiteralKind::X) => {
+            HexFixed(HexLiteralKind::X) => {
                 write!(f, r"\x{:02X}", self.c as u32)
             }
-            HexFixed(AstHexLiteralKind::UnicodeShort) => {
+            HexFixed(HexLiteralKind::UnicodeShort) => {
                 write!(f, r"\u{:04X}", self.c as u32)
             }
-            HexFixed(AstHexLiteralKind::UnicodeLong) => {
+            HexFixed(HexLiteralKind::UnicodeLong) => {
                 write!(f, r"\U{:08X}", self.c as u32)
             }
-            HexBrace(AstHexLiteralKind::X) => {
+            HexBrace(HexLiteralKind::X) => {
                 write!(f, r"\x{{{:X}}}", self.c as u32)
             }
-            HexBrace(AstHexLiteralKind::UnicodeShort) => {
+            HexBrace(HexLiteralKind::UnicodeShort) => {
                 write!(f, r"\u{{{:X}}}", self.c as u32)
             }
-            HexBrace(AstHexLiteralKind::UnicodeLong) => {
+            HexBrace(HexLiteralKind::UnicodeLong) => {
                 write!(f, r"\U{{{:X}}}", self.c as u32)
             }
         }
@@ -509,12 +509,12 @@ impl fmt::Display for AstLiteral {
 
 /// The kind of a single literal expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstLiteralKind {
+pub enum LiteralKind {
     /// The literal is written verbatim, e.g., `a` or `☃`.
     Verbatim,
     /// The literal is written as a specially recognized escape, e.g., `\f`
     /// or `\n`.
-    Special(AstSpecialLiteralKind),
+    Special(SpecialLiteralKind),
     /// The literal is written as an escape because it is punctuation, e.g.,
     /// `\*` or `\[`.
     Punctuation,
@@ -523,11 +523,11 @@ pub enum AstLiteralKind {
     /// The literal is written as a hex code with a fixed number of digits
     /// depending on the type of the escape, e.g., `\x61` or or `\u0061` or
     /// `\U00000061`.
-    HexFixed(AstHexLiteralKind),
+    HexFixed(HexLiteralKind),
     /// The literal is written as a hex code with a bracketed number of
     /// digits. The only restriction is that the bracketed hex code must refer
     /// to a valid Unicode scalar value.
-    HexBrace(AstHexLiteralKind),
+    HexBrace(HexLiteralKind),
 }
 
 /// The type of a special literal.
@@ -535,7 +535,7 @@ pub enum AstLiteralKind {
 /// A special literal is a special escape sequence recognized by the regex
 /// parser, e.g., `\f` or `\n`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstSpecialLiteralKind {
+pub enum SpecialLiteralKind {
     /// Bell, spelled `\a` (`\x07`).
     Bell,
     /// Form feed, spelled `\f` (`\x0C`).
@@ -553,9 +553,9 @@ pub enum AstSpecialLiteralKind {
     Space,
 }
 
-impl fmt::Display for AstSpecialLiteralKind {
+impl fmt::Display for SpecialLiteralKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstSpecialLiteralKind::*;
+        use self::SpecialLiteralKind::*;
 
         match *self {
             Bell => r"\a".fmt(f),
@@ -575,7 +575,7 @@ impl fmt::Display for AstSpecialLiteralKind {
 /// differ when used without brackets in the number of hex digits that must
 /// follow.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstHexLiteralKind {
+pub enum HexLiteralKind {
     /// A `\x` prefix. When used without brackets, this form is limited to
     /// two digits.
     X,
@@ -587,80 +587,80 @@ pub enum AstHexLiteralKind {
     UnicodeLong,
 }
 
-impl AstHexLiteralKind {
+impl HexLiteralKind {
     /// The number of digits that must be used with this literal form when
     /// used without brackets. When used with brackets, there is no
     /// restriction on the number of digits.
     pub fn digits(&self) -> u32 {
         match *self {
-            AstHexLiteralKind::X => 2,
-            AstHexLiteralKind::UnicodeShort => 4,
-            AstHexLiteralKind::UnicodeLong => 8,
+            HexLiteralKind::X => 2,
+            HexLiteralKind::UnicodeShort => 4,
+            HexLiteralKind::UnicodeLong => 8,
         }
     }
 }
 
 /// A single character class expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClass {
+pub enum Class {
     /// A perl character class, e.g., `\d` or `\W`.
-    Perl(AstClassPerl),
+    Perl(ClassPerl),
     /// A Unicode character class, e.g., `\pL` or `\p{Greek}`.
-    Unicode(AstClassUnicode),
+    Unicode(ClassUnicode),
     /// A character class set, which may contain zero or more character ranges
     /// and/or zero or more nested classes. e.g., `[a-zA-Z\pL]`.
-    Set(AstClassSet),
+    Set(ClassSet),
 }
 
-impl AstClass {
+impl Class {
     /// Return the span of this character class.
     pub fn span(&self) -> &Span {
         match *self {
-            AstClass::Perl(ref x) => &x.span,
-            AstClass::Unicode(ref x) => &x.span,
-            AstClass::Set(ref x) => &x.span,
+            Class::Perl(ref x) => &x.span,
+            Class::Unicode(ref x) => &x.span,
+            Class::Set(ref x) => &x.span,
         }
     }
 }
 
-impl fmt::Display for AstClass {
+impl fmt::Display for Class {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstClass::Perl(ref x) => x.fmt(f),
-            AstClass::Unicode(ref x) => x.fmt(f),
-            AstClass::Set(ref x) => x.fmt(f),
+            Class::Perl(ref x) => x.fmt(f),
+            Class::Unicode(ref x) => x.fmt(f),
+            Class::Set(ref x) => x.fmt(f),
         }
     }
 }
 
 /// A Perl character class.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassPerl {
+pub struct ClassPerl {
     /// The span of this class.
     pub span: Span,
     /// The kind of Perl class.
-    pub kind: AstClassPerlKind,
+    pub kind: ClassPerlKind,
     /// Whether the class is negated or not. e.g., `\d` is not negated but
     /// `\D` is.
     pub negated: bool,
 }
 
-impl fmt::Display for AstClassPerl {
+impl fmt::Display for ClassPerl {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.kind {
-            AstClassPerlKind::Digit if self.negated => r"\D".fmt(f),
-            AstClassPerlKind::Digit => r"\d".fmt(f),
-            AstClassPerlKind::Space if self.negated => r"\S".fmt(f),
-            AstClassPerlKind::Space => r"\s".fmt(f),
-            AstClassPerlKind::Word if self.negated => r"\W".fmt(f),
-            AstClassPerlKind::Word => r"\w".fmt(f),
+            ClassPerlKind::Digit if self.negated => r"\D".fmt(f),
+            ClassPerlKind::Digit => r"\d".fmt(f),
+            ClassPerlKind::Space if self.negated => r"\S".fmt(f),
+            ClassPerlKind::Space => r"\s".fmt(f),
+            ClassPerlKind::Word if self.negated => r"\W".fmt(f),
+            ClassPerlKind::Word => r"\w".fmt(f),
         }
     }
 }
 
 /// The available Perl character classes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassPerlKind {
+pub enum ClassPerlKind {
     /// Decimal numbers.
     Digit,
     /// Whitespace.
@@ -671,19 +671,19 @@ pub enum AstClassPerlKind {
 
 /// An ASCII character class.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassAscii {
+pub struct ClassAscii {
     /// The span of this class.
     pub span: Span,
     /// The kind of ASCII class.
-    pub kind: AstClassAsciiKind,
+    pub kind: ClassAsciiKind,
     /// Whether the class is negated or not. e.g., `[[:alpha:]]` is not negated
     /// but `[[:^alpha:]]` is.
     pub negated: bool,
 }
 
-impl fmt::Display for AstClassAscii {
+impl fmt::Display for ClassAscii {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstClassAsciiKind::*;
+        use self::ClassAsciiKind::*;
 
         match self.kind {
             Alnum if self.negated => "[:^alnum:]".fmt(f),
@@ -720,7 +720,7 @@ impl fmt::Display for AstClassAscii {
 
 /// The available ASCII character classes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassAsciiKind {
+pub enum ClassAsciiKind {
     /// `[0-9A-Za-z]`
     Alnum,
     /// `[A-Za-z]`
@@ -751,16 +751,16 @@ pub enum AstClassAsciiKind {
     Xdigit,
 }
 
-impl AstClassAsciiKind {
-    /// Return the corresponding AstClassAsciiKind variant for the given name.
+impl ClassAsciiKind {
+    /// Return the corresponding ClassAsciiKind variant for the given name.
     ///
     /// The name given should correspond to the lowercase version of the
-    /// variant name. e.g., `cntrl` is the name for `AstClassAsciiKind::Cntrl`.
+    /// variant name. e.g., `cntrl` is the name for `ClassAsciiKind::Cntrl`.
     ///
     /// If no variant with the corresponding name exists, then `None` is
     /// returned.
-    pub fn from_name(name: &str) -> Option<AstClassAsciiKind> {
-        use self::AstClassAsciiKind::*;
+    pub fn from_name(name: &str) -> Option<ClassAsciiKind> {
+        use self::ClassAsciiKind::*;
         match name {
             "alnum" => Some(Alnum),
             "alpha" => Some(Alpha),
@@ -783,7 +783,7 @@ impl AstClassAsciiKind {
 
 /// A Unicode character class.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassUnicode {
+pub struct ClassUnicode {
     /// The span of this class.
     pub span: Span,
     /// Whether this class is negated or not.
@@ -797,25 +797,25 @@ pub struct AstClassUnicode {
     /// or not, use the `is_negated` method.
     pub negated: bool,
     /// The kind of Unicode class.
-    pub kind: AstClassUnicodeKind,
+    pub kind: ClassUnicodeKind,
 }
 
-impl AstClassUnicode {
+impl ClassUnicode {
     /// Returns true if this class has been negated.
     ///
     /// Note that this takes the Unicode op into account, if it's present.
     /// e.g., `is_negated` for `\P{scx!=Katakana}` will return `false`.
     pub fn is_negated(&self) -> bool {
         match self.kind {
-            AstClassUnicodeKind::NamedValue {
-                op: AstClassUnicodeOpKind::NotEqual, ..
+            ClassUnicodeKind::NamedValue {
+                op: ClassUnicodeOpKind::NotEqual, ..
             } => !self.negated,
             _ => self.negated,
         }
     }
 }
 
-impl fmt::Display for AstClassUnicode {
+impl fmt::Display for ClassUnicode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.negated {
             write!(f, r"\P{}", self.kind)
@@ -827,7 +827,7 @@ impl fmt::Display for AstClassUnicode {
 
 /// The available forms of Unicode character classes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassUnicodeKind {
+pub enum ClassUnicodeKind {
     /// A one letter abbreviated class, e.g., `\pN`.
     OneLetter(char),
     /// A binary property, general category or script. The string may be
@@ -836,7 +836,7 @@ pub enum AstClassUnicodeKind {
     /// A property name and an associated value.
     NamedValue {
         /// The type of Unicode op used to associate `name` with `value`.
-        op: AstClassUnicodeOpKind,
+        op: ClassUnicodeOpKind,
         /// The property name (which may be empty).
         name: String,
         /// The property value (which may be empty).
@@ -844,9 +844,9 @@ pub enum AstClassUnicodeKind {
     },
 }
 
-impl fmt::Display for AstClassUnicodeKind {
+impl fmt::Display for ClassUnicodeKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstClassUnicodeKind::*;
+        use self::ClassUnicodeKind::*;
 
         match *self {
             OneLetter(c) => c.fmt(f),
@@ -860,7 +860,7 @@ impl fmt::Display for AstClassUnicodeKind {
 
 /// The type of op used in a Unicode character class.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassUnicodeOpKind {
+pub enum ClassUnicodeOpKind {
     /// A property set to a specific value, e.g., `\p{scx=Katakana}`.
     Equal,
     /// A property set to a specific value using a colon, e.g.,
@@ -870,19 +870,19 @@ pub enum AstClassUnicodeOpKind {
     NotEqual,
 }
 
-impl AstClassUnicodeOpKind {
+impl ClassUnicodeOpKind {
     /// Whether the op is an equality op or not.
     pub fn is_equal(&self) -> bool {
         match *self {
-            AstClassUnicodeOpKind::Equal|AstClassUnicodeOpKind::Colon => true,
+            ClassUnicodeOpKind::Equal|ClassUnicodeOpKind::Colon => true,
             _ => false,
         }
     }
 }
 
-impl fmt::Display for AstClassUnicodeOpKind {
+impl fmt::Display for ClassUnicodeOpKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstClassUnicodeOpKind::*;
+        use self::ClassUnicodeOpKind::*;
 
         match *self {
             Equal => '='.fmt(f),
@@ -894,17 +894,17 @@ impl fmt::Display for AstClassUnicodeOpKind {
 
 /// A Unicode character class set, e.g., `[a-z0-9]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassSet {
+pub struct ClassSet {
     /// The span of this class.
     pub span: Span,
     /// Whether this class is negated or not. e.g., `[a]` is not negated but
     /// `[^a]` is.
     pub negated: bool,
     /// The top-level op of this set.
-    pub op: AstClassSetOp,
+    pub op: ClassSetOp,
 }
 
-impl fmt::Display for AstClassSet {
+impl fmt::Display for ClassSet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.negated {
             write!(f, r"[^{}]", self.op)
@@ -918,43 +918,43 @@ impl fmt::Display for AstClassSet {
 ///
 /// An operation is either a union of many things, or a binary operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassSetOp {
+pub enum ClassSetOp {
     /// A union of items in a class. A union may contain a single item.
-    Union(AstClassSetUnion),
+    Union(ClassSetUnion),
     /// A single binary operation (i.e., &&, -- or ~~).
-    BinaryOp(AstClassSetBinaryOp),
+    BinaryOp(ClassSetBinaryOp),
 }
 
-impl AstClassSetOp {
+impl ClassSetOp {
     /// Return the span of this character class set operation.
     pub fn span(&self) -> &Span {
         match *self {
-            AstClassSetOp::Union(ref x) => &x.span,
-            AstClassSetOp::BinaryOp(ref x) => &x.span,
+            ClassSetOp::Union(ref x) => &x.span,
+            ClassSetOp::BinaryOp(ref x) => &x.span,
         }
     }
 }
 
-impl fmt::Display for AstClassSetOp {
+impl fmt::Display for ClassSetOp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstClassSetOp::Union(ref x) => x.fmt(f),
-            AstClassSetOp::BinaryOp(ref x) => x.fmt(f),
+            ClassSetOp::Union(ref x) => x.fmt(f),
+            ClassSetOp::BinaryOp(ref x) => x.fmt(f),
         }
     }
 }
 
 /// A union of items inside a character class set.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassSetUnion {
+pub struct ClassSetUnion {
     /// The span of the items in this operation. e.g., the `a-z0-9` in
     /// `[^a-z0-9]`
     pub span: Span,
     /// The sequence of items that make up this union.
-    pub items: Vec<AstClassSetItem>,
+    pub items: Vec<ClassSetItem>,
 }
 
-impl AstClassSetUnion {
+impl ClassSetUnion {
     /// Push a new item in this union.
     ///
     /// The ending position of this union's span is updated to the ending
@@ -965,7 +965,7 @@ impl AstClassSetUnion {
     /// In other words, if you only use this method to add items to a union
     /// and you set the spans on each item correctly, then you should never
     /// need to adjust the span of the union directly.
-    pub fn push(&mut self, item: AstClassSetItem) {
+    pub fn push(&mut self, item: ClassSetItem) {
         if self.items.is_empty() {
             self.span.start = item.span().start;
         }
@@ -974,7 +974,7 @@ impl AstClassSetUnion {
     }
 }
 
-impl fmt::Display for AstClassSetUnion {
+impl fmt::Display for ClassSetUnion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for x in &self.items {
             try!(x.fmt(f));
@@ -985,52 +985,52 @@ impl fmt::Display for AstClassSetUnion {
 
 /// A single component of a character class set.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassSetItem {
+pub enum ClassSetItem {
     /// A single literal.
-    Literal(AstLiteral),
+    Literal(Literal),
     /// A range between two literals.
-    Range(AstClassSetRange),
+    Range(ClassSetRange),
     /// An ASCII character class, e.g., `[:alnum:]` or `[:punct:]`.
-    Ascii(AstClassAscii),
+    Ascii(ClassAscii),
     /// A nested character class.
-    Class(Box<AstClass>),
+    Class(Box<Class>),
 }
 
-impl AstClassSetItem {
+impl ClassSetItem {
     /// Return the span of this character class set item.
     pub fn span(&self) -> &Span {
         match *self {
-            AstClassSetItem::Literal(ref x) => &x.span,
-            AstClassSetItem::Range(ref x) => &x.span,
-            AstClassSetItem::Ascii(ref x) => &x.span,
-            AstClassSetItem::Class(ref x) => x.span(),
+            ClassSetItem::Literal(ref x) => &x.span,
+            ClassSetItem::Range(ref x) => &x.span,
+            ClassSetItem::Ascii(ref x) => &x.span,
+            ClassSetItem::Class(ref x) => x.span(),
         }
     }
 }
 
-impl fmt::Display for AstClassSetItem {
+impl fmt::Display for ClassSetItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstClassSetItem::Literal(ref x) => x.fmt(f),
-            AstClassSetItem::Range(ref x) => x.fmt(f),
-            AstClassSetItem::Ascii(ref x) => x.fmt(f),
-            AstClassSetItem::Class(ref x) => x.fmt(f),
+            ClassSetItem::Literal(ref x) => x.fmt(f),
+            ClassSetItem::Range(ref x) => x.fmt(f),
+            ClassSetItem::Ascii(ref x) => x.fmt(f),
+            ClassSetItem::Class(ref x) => x.fmt(f),
         }
     }
 }
 
 /// A single character class range in a set.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassSetRange {
+pub struct ClassSetRange {
     /// The span of this range.
     pub span: Span,
     /// The start of this range.
-    pub start: AstLiteral,
+    pub start: Literal,
     /// The end of this range.
-    pub end: AstLiteral,
+    pub end: Literal,
 }
 
-impl fmt::Display for AstClassSetRange {
+impl fmt::Display for ClassSetRange {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{}", self.start, self.end)
     }
@@ -1038,18 +1038,18 @@ impl fmt::Display for AstClassSetRange {
 
 /// A Unicode character class set operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassSetBinaryOp {
+pub struct ClassSetBinaryOp {
     /// The span of this operation. e.g., the `a-z--[h-p]` in `[a-z--h-p]`.
     pub span: Span,
     /// The type of this set operation.
-    pub kind: AstClassSetBinaryOpKind,
+    pub kind: ClassSetBinaryOpKind,
     /// The left hand side of the operation.
-    pub lhs: Box<AstClassSetOp>,
+    pub lhs: Box<ClassSetOp>,
     /// The right hand side of the operation.
-    pub rhs: Box<AstClassSetOp>,
+    pub rhs: Box<ClassSetOp>,
 }
 
-impl fmt::Display for AstClassSetBinaryOp {
+impl fmt::Display for ClassSetBinaryOp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}{}{}", self.lhs, self.kind, self.rhs)
     }
@@ -1061,7 +1061,7 @@ impl fmt::Display for AstClassSetBinaryOp {
 /// explicit union operator. Concatenation inside a character class corresponds
 /// to the union operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AstClassSetBinaryOpKind {
+pub enum ClassSetBinaryOpKind {
     /// The intersection of two sets, e.g., `\pN&&[a-z]`.
     Intersection,
     /// The difference of two sets, e.g., `\pN--[0-9]`.
@@ -1072,26 +1072,26 @@ pub enum AstClassSetBinaryOpKind {
     SymmetricDifference,
 }
 
-impl fmt::Display for AstClassSetBinaryOpKind {
+impl fmt::Display for ClassSetBinaryOpKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstClassSetBinaryOpKind::Intersection => "&&".fmt(f),
-            AstClassSetBinaryOpKind::Difference => "--".fmt(f),
-            AstClassSetBinaryOpKind::SymmetricDifference => "~~".fmt(f),
+            ClassSetBinaryOpKind::Intersection => "&&".fmt(f),
+            ClassSetBinaryOpKind::Difference => "--".fmt(f),
+            ClassSetBinaryOpKind::SymmetricDifference => "~~".fmt(f),
         }
     }
 }
 
 /// A single zero-width assertion.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstAssertion {
+pub struct Assertion {
     /// The span of this assertion.
     pub span: Span,
     /// The assertion kind, e.g., `\b` or `^`.
-    pub kind: AstAssertionKind,
+    pub kind: AssertionKind,
 }
 
-impl fmt::Display for AstAssertion {
+impl fmt::Display for Assertion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.kind.fmt(f)
     }
@@ -1099,7 +1099,7 @@ impl fmt::Display for AstAssertion {
 
 /// An assertion kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstAssertionKind {
+pub enum AssertionKind {
     /// `^`
     StartLine,
     /// `$`
@@ -1114,57 +1114,57 @@ pub enum AstAssertionKind {
     NotWordBoundary,
 }
 
-impl fmt::Display for AstAssertionKind {
+impl fmt::Display for AssertionKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstAssertionKind::StartLine => '^'.fmt(f),
-            AstAssertionKind::EndLine => '$'.fmt(f),
-            AstAssertionKind::StartText => r"\A".fmt(f),
-            AstAssertionKind::EndText => r"\z".fmt(f),
-            AstAssertionKind::WordBoundary => r"\b".fmt(f),
-            AstAssertionKind::NotWordBoundary => r"\B".fmt(f),
+            AssertionKind::StartLine => '^'.fmt(f),
+            AssertionKind::EndLine => '$'.fmt(f),
+            AssertionKind::StartText => r"\A".fmt(f),
+            AssertionKind::EndText => r"\z".fmt(f),
+            AssertionKind::WordBoundary => r"\b".fmt(f),
+            AssertionKind::NotWordBoundary => r"\B".fmt(f),
         }
     }
 }
 
 /// A repetition operation applied to a regular expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstRepetition {
+pub struct Repetition {
     /// The span of this operation.
     pub span: Span,
     /// The actual operation.
-    pub op: AstRepetitionOp,
+    pub op: RepetitionOp,
     /// Whether this operation was applied greedily or not.
     pub greedy: bool,
     /// The regular expression under repetition.
     pub ast: Box<Ast>,
 }
 
-impl fmt::Display for AstRepetition {
+impl fmt::Display for Repetition {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.op.kind {
-            AstRepetitionKind::ZeroOrOne => {
+            RepetitionKind::ZeroOrOne => {
                 if self.greedy {
                     write!(f, "{}?", self.ast)
                 } else {
                     write!(f, "{}??", self.ast)
                 }
             }
-            AstRepetitionKind::ZeroOrMore => {
+            RepetitionKind::ZeroOrMore => {
                 if self.greedy {
                     write!(f, "{}*", self.ast)
                 } else {
                     write!(f, "{}*?", self.ast)
                 }
             }
-            AstRepetitionKind::OneOrMore => {
+            RepetitionKind::OneOrMore => {
                 if self.greedy {
                     write!(f, "{}+", self.ast)
                 } else {
                     write!(f, "{}+?", self.ast)
                 }
             }
-            AstRepetitionKind::Range(ref x) => {
+            RepetitionKind::Range(ref x) => {
                 if self.greedy {
                     write!(f, "{}{}", self.ast, x)
                 } else {
@@ -1177,17 +1177,17 @@ impl fmt::Display for AstRepetition {
 
 /// The repetition operator itself.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstRepetitionOp {
+pub struct RepetitionOp {
     /// The span of this operator. This includes things like `+`, `*?` and
     /// `{m,n}`.
     pub span: Span,
     /// The type of operation.
-    pub kind: AstRepetitionKind,
+    pub kind: RepetitionKind,
 }
 
 /// The kind of a repetition operator.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstRepetitionKind {
+pub enum RepetitionKind {
     /// `?`
     ZeroOrOne,
     /// `*`
@@ -1195,12 +1195,12 @@ pub enum AstRepetitionKind {
     /// `+`
     OneOrMore,
     /// `{m,n}`
-    Range(AstRepetitionRange),
+    Range(RepetitionRange),
 }
 
 /// A range repetition operator.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstRepetitionRange {
+pub enum RepetitionRange {
     /// `{m}`
     Exactly(u32),
     /// `{m,}`
@@ -1209,12 +1209,12 @@ pub enum AstRepetitionRange {
     Bounded(u32, u32),
 }
 
-impl fmt::Display for AstRepetitionRange {
+impl fmt::Display for RepetitionRange {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstRepetitionRange::Exactly(x) => write!(f, "{{{}}}", x),
-            AstRepetitionRange::AtLeast(x) => write!(f, "{{{},}}", x),
-            AstRepetitionRange::Bounded(x, y) => write!(f, "{{{},{}}}", x, y),
+            RepetitionRange::Exactly(x) => write!(f, "{{{}}}", x),
+            RepetitionRange::AtLeast(x) => write!(f, "{{{},}}", x),
+            RepetitionRange::Bounded(x, y) => write!(f, "{{{},{}}}", x, y),
         }
     }
 }
@@ -1226,36 +1226,36 @@ impl fmt::Display for AstRepetitionRange {
 /// contains a sub-expression, e.g., `(a)`, `(?P<name>a)`, `(?:a)` and
 /// `(?is:a)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstGroup {
+pub struct Group {
     /// The span of this group.
     pub span: Span,
     /// The kind of this group.
-    pub kind: AstGroupKind,
+    pub kind: GroupKind,
     /// The regular expression in this group.
     pub ast: Box<Ast>,
 }
 
-impl AstGroup {
+impl Group {
     /// If this group is non-capturing, then this returns the (possibly empty)
     /// set of flags. Otherwise, `None` is returned.
-    pub fn flags(&self) -> Option<&AstFlags> {
+    pub fn flags(&self) -> Option<&Flags> {
         match self.kind {
-            AstGroupKind::NonCapturing(ref flags) => Some(flags),
+            GroupKind::NonCapturing(ref flags) => Some(flags),
             _ => None,
         }
     }
 }
 
-impl fmt::Display for AstGroup {
+impl fmt::Display for Group {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.kind {
-            AstGroupKind::CaptureIndex => {
+            GroupKind::CaptureIndex => {
                 write!(f, "({})", self.ast)
             }
-            AstGroupKind::CaptureName(ref x) => {
+            GroupKind::CaptureName(ref x) => {
                 write!(f, "(?P<{}>{})", x, self.ast)
             }
-            AstGroupKind::NonCapturing(ref x) => {
+            GroupKind::NonCapturing(ref x) => {
                 write!(f, "(?{}:{})", x, self.ast)
             }
         }
@@ -1264,13 +1264,13 @@ impl fmt::Display for AstGroup {
 
 /// The kind of a group.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstGroupKind {
+pub enum GroupKind {
     /// `(a)`
     CaptureIndex,
     /// `(?P<name>a)`
-    CaptureName(AstCaptureName),
+    CaptureName(CaptureName),
     /// `(?:a)` and `(?i:a)`
-    NonCapturing(AstFlags),
+    NonCapturing(Flags),
 }
 
 /// A capture name.
@@ -1278,14 +1278,14 @@ pub enum AstGroupKind {
 /// This corresponds to the name itself between the angle brackets in, e.g.,
 /// `(?P<foo>expr)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstCaptureName {
+pub struct CaptureName {
     /// The span of this capture name.
     pub span: Span,
     /// The capture name.
     pub name: String,
 }
 
-impl fmt::Display for AstCaptureName {
+impl fmt::Display for CaptureName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.name.fmt(f)
     }
@@ -1293,14 +1293,14 @@ impl fmt::Display for AstCaptureName {
 
 /// A group of flags that is not applied to a particular regular expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstSetFlags {
+pub struct SetFlags {
     /// The span of these flags, including the grouping parentheses.
     pub span: Span,
     /// The actual sequence of flags.
-    pub flags: AstFlags,
+    pub flags: Flags,
 }
 
-impl fmt::Display for AstSetFlags {
+impl fmt::Display for SetFlags {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "(?{})", self.flags)
     }
@@ -1310,21 +1310,21 @@ impl fmt::Display for AstSetFlags {
 ///
 /// This corresponds only to the sequence of flags themselves, e.g., `is-u`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstFlags {
+pub struct Flags {
     /// The span of this group of flags.
     pub span: Span,
     /// A sequence of flag items. Each item is either a flag or a negation
     /// operator.
-    pub items: Vec<AstFlagsItem>,
+    pub items: Vec<FlagsItem>,
 }
 
-impl AstFlags {
+impl Flags {
     /// Add the given item to this sequence of flags.
     ///
     /// If the item was added successfully, then `None` is returned. If the
     /// given item is a duplicate, then `Some(i)` is returned, where
     /// `items[i].kind == item.kind`.
-    pub fn add_item(&mut self, item: AstFlagsItem) -> Option<usize> {
+    pub fn add_item(&mut self, item: FlagsItem) -> Option<usize> {
         for (i, x) in self.items.iter().enumerate() {
             if x.kind == item.kind {
                 return Some(i);
@@ -1343,14 +1343,14 @@ impl AstFlags {
     /// is returned.
     ///
     /// Otherwise, `None` is returned.
-    pub fn flag_state(&self, flag: AstFlag) -> Option<bool> {
+    pub fn flag_state(&self, flag: Flag) -> Option<bool> {
         let mut negated = false;
         for x in &self.items {
             match x.kind {
-                AstFlagsItemKind::Negation => {
+                FlagsItemKind::Negation => {
                     negated = true;
                 }
-                AstFlagsItemKind::Flag(ref xflag) if xflag == &flag => {
+                FlagsItemKind::Flag(ref xflag) if xflag == &flag => {
                     return Some(!negated);
                 }
                 _ => {}
@@ -1360,7 +1360,7 @@ impl AstFlags {
     }
 }
 
-impl fmt::Display for AstFlags {
+impl fmt::Display for Flags {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for item in &self.items {
             try!(item.fmt(f));
@@ -1371,14 +1371,14 @@ impl fmt::Display for AstFlags {
 
 /// A single item in a group of flags.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstFlagsItem {
+pub struct FlagsItem {
     /// The span of this item.
     pub span: Span,
     /// The kind of this item.
-    pub kind: AstFlagsItemKind,
+    pub kind: FlagsItemKind,
 }
 
-impl fmt::Display for AstFlagsItem {
+impl fmt::Display for FlagsItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.kind.fmt(f)
     }
@@ -1386,36 +1386,36 @@ impl fmt::Display for AstFlagsItem {
 
 /// The kind of an item in a group of flags.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstFlagsItemKind {
+pub enum FlagsItemKind {
     /// A negation operator applied to all subsequent flags in the enclosing
     /// group.
     Negation,
     /// A single flag in a group.
-    Flag(AstFlag),
+    Flag(Flag),
 }
 
-impl AstFlagsItemKind {
+impl FlagsItemKind {
     /// Returns true if and only if this item is a negation operator.
     pub fn is_negation(&self) -> bool {
         match *self {
-            AstFlagsItemKind::Negation => true,
+            FlagsItemKind::Negation => true,
             _ => false,
         }
     }
 }
 
-impl fmt::Display for AstFlagsItemKind {
+impl fmt::Display for FlagsItemKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AstFlagsItemKind::Negation => "-".fmt(f),
-            AstFlagsItemKind::Flag(ref flag) => flag.fmt(f),
+            FlagsItemKind::Negation => "-".fmt(f),
+            FlagsItemKind::Flag(ref flag) => flag.fmt(f),
         }
     }
 }
 
 /// A single flag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AstFlag {
+pub enum Flag {
     /// `i`
     CaseInsensitive,
     /// `m`
@@ -1430,9 +1430,9 @@ pub enum AstFlag {
     IgnoreWhitespace,
 }
 
-impl fmt::Display for AstFlag {
+impl fmt::Display for Flag {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AstFlag::*;
+        use self::Flag::*;
         match *self {
             CaseInsensitive => write!(f, "i"),
             MultiLine => write!(f, "m"),
@@ -1457,7 +1457,7 @@ mod tests {
     {
         let mut builder = ParserBuilder::new();
         f(&mut builder);
-        let ast = builder.build(given).parse().unwrap();
+        let ast = builder.build().parse(given).unwrap();
         assert_eq!(format!("{}", ast), given);
     }
 

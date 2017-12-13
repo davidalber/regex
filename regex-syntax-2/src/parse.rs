@@ -1,10 +1,11 @@
+use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::mem;
 use std::result;
 
-use ast::*;
+use ast::{self, Ast, Position, Span};
 
-type Result<T> = result::Result<T, AstError>;
+type Result<T> = result::Result<T, ast::Error>;
 
 /// A simple binary sum type.
 ///
@@ -23,11 +24,11 @@ enum Either<Left, Right> {
 /// within a set character class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Primitive {
-    Literal(AstLiteral),
-    Assertion(AstAssertion),
+    Literal(ast::Literal),
+    Assertion(ast::Assertion),
     Dot(Span),
-    Perl(AstClassPerl),
-    Unicode(AstClassUnicode),
+    Perl(ast::ClassPerl),
+    Unicode(ast::ClassUnicode),
 }
 
 impl Primitive {
@@ -48,8 +49,8 @@ impl Primitive {
             Primitive::Literal(lit) => Ast::Literal(lit),
             Primitive::Assertion(assert) => Ast::Assertion(assert),
             Primitive::Dot(span) => Ast::Dot(span),
-            Primitive::Perl(cls) => Ast::Class(AstClass::Perl(cls)),
-            Primitive::Unicode(cls) => Ast::Class(AstClass::Unicode(cls)),
+            Primitive::Perl(cls) => Ast::Class(ast::Class::Perl(cls)),
+            Primitive::Unicode(cls) => Ast::Class(ast::Class::Unicode(cls)),
         }
     }
 
@@ -57,20 +58,20 @@ impl Primitive {
     ///
     /// If this primitive is not a legal item (i.e., an assertion or a dot),
     /// then return an error.
-    fn into_class_set_item(self) -> Result<AstClassSetItem> {
+    fn into_class_set_item(self) -> Result<ast::ClassSetItem> {
         use self::Primitive::*;
 
         match self {
-            Literal(lit) => Ok(AstClassSetItem::Literal(lit)),
+            Literal(lit) => Ok(ast::ClassSetItem::Literal(lit)),
             Perl(cls) => {
-                Ok(AstClassSetItem::Class(Box::new(AstClass::Perl(cls))))
+                Ok(ast::ClassSetItem::Class(Box::new(ast::Class::Perl(cls))))
             }
             Unicode(cls) => {
-                Ok(AstClassSetItem::Class(Box::new(AstClass::Unicode(cls))))
+                Ok(ast::ClassSetItem::Class(Box::new(ast::Class::Unicode(cls))))
             }
-            x => Err(AstError {
+            x => Err(ast::Error {
                 span: *x.span(),
-                kind: AstErrorKind::ClassIllegal,
+                kind: ast::ErrorKind::ClassIllegal,
             })
         }
     }
@@ -81,14 +82,14 @@ impl Primitive {
     ///
     /// If this primitive is not a legal item (i.e., a class, assertion or a
     /// dot), then return an error.
-    fn into_class_literal(self) -> Result<AstLiteral> {
+    fn into_class_literal(self) -> Result<ast::Literal> {
         use self::Primitive::*;
 
         match self {
             Literal(lit) => Ok(lit),
-            x => Err(AstError {
+            x => Err(ast::Error {
                 span: *x.span(),
-                kind: AstErrorKind::ClassIllegal,
+                kind: ast::ErrorKind::ClassIllegal,
             })
         }
     }
@@ -146,12 +147,12 @@ impl ParserBuilder {
     }
 
     /// Build a parser from this configuration with the given pattern.
-    pub fn build(&self, pattern: &str) -> Parser {
+    pub fn build(&self) -> Parser {
         Parser {
-            pattern: pattern.to_string(),
+            pos: Cell::new(Position { offset: 0, line: 1, column: 1 }),
             nest_limit: self.nest_limit,
             octal: self.octal,
-            pos: Cell::new(Position { offset: 0, line: 1, column: 1 }),
+            initial_ignore_space: self.ignore_space,
             ignore_space: Cell::new(self.ignore_space),
             comments: RefCell::new(vec![]),
             stack_group: RefCell::new(vec![]),
@@ -212,9 +213,10 @@ impl ParserBuilder {
 /// This parses a string representation of a regular expression into an
 /// abstract syntax tree. The size of the tree is proportional to the length
 /// of the regular expression pattern.
+#[derive(Clone, Debug)]
 pub struct Parser {
-    /// The full regular expression provided by the user.
-    pattern: String,
+    /// The current position of the parser.
+    pos: Cell<Position>,
     /// The maximum number of open parens/brackets allowed. If the parser
     /// exceeds this number, then an error is returned.
     nest_limit: u32,
@@ -222,13 +224,14 @@ pub struct Parser {
     /// return an error helpfully pointing out that backreferences are not
     /// supported.
     octal: bool,
-    /// The current position of the parser.
-    pos: Cell<Position>,
+    /// The initial setting for `ignore_space` as provided by `ParserBuilder`.
+    /// This is used when reseting the parser's state.
+    initial_ignore_space: bool,
     /// Whether whitespace should be ignored. When enabled, comments are
     /// also permitted.
     ignore_space: Cell<bool>,
     /// A list of comments, in order of appearance.
-    comments: RefCell<Vec<AstComment>>,
+    comments: RefCell<Vec<ast::Comment>>,
     /// A stack of grouped sub-expressions, including alternations.
     stack_group: RefCell<Vec<GroupState>>,
     /// A stack of nested character classes. This is only non-empty when
@@ -236,16 +239,30 @@ pub struct Parser {
     stack_class: RefCell<Vec<ClassState>>,
 }
 
+/// ParserI is the internal parser implementation.
+///
+/// We could elide this separate type and use a `RefCell<String>` for the
+/// pattern instead, but a `String` is much more convenient (because you can
+/// get a `&str` more easily).
+#[derive(Clone, Debug)]
+struct ParserI<P> {
+    /// The full regular expression provided by the user.
+    pattern: String,
+    /// The parser state/configuration.
+    parser: P,
+}
+
 /// GroupState represents a single stack frame while parsing nested groups
 /// and alternations. Each frame records the state up to an opening parenthesis
 /// or a alternating bracket `|`.
+#[derive(Clone, Debug)]
 enum GroupState {
     /// This state is pushed whenever an opening group is found.
     Group {
         /// The concatenation immediately preceding the opening group.
-        concat: AstConcat,
+        concat: ast::Concat,
         /// The group that has been opened. Its sub-AST is always empty.
-        group: AstGroup,
+        group: ast::Group,
         /// Whether this group has the `x` flag enabled or not.
         ignore_space: bool,
     },
@@ -253,7 +270,7 @@ enum GroupState {
     /// an alternation branch is found and this state is at the top of the
     /// stack, then this state should be modified to include the new
     /// alternation.
-    Alternation(AstAlternation),
+    Alternation(ast::Alternation),
 }
 
 /// ClassState represents a single stack frame while parsing character classes.
@@ -262,23 +279,24 @@ enum GroupState {
 ///
 /// Note that a parser's character class stack is only non-empty when parsing
 /// a character class. In all other cases, it is empty.
+#[derive(Clone, Debug)]
 enum ClassState {
     /// This state is pushed whenever an opening bracket is found.
     Open {
         /// The union of class items immediately preceding this class.
-        union: AstClassSetUnion,
+        union: ast::ClassSetUnion,
         /// The class that has been opened. Typically this just corresponds
         /// to the `[`, but it can also include `[^` since `^` indicates
         /// negation of the class.
-        set: AstClassSet,
+        set: ast::ClassSet,
     },
     /// This state is pushed when a operator is seen. When popped, the stored
     /// set becomes the left hand side of the operator.
     Op {
         /// The type of the operation, i.e., &&, -- or ~~.
-        kind: AstClassSetBinaryOpKind,
+        kind: ast::ClassSetBinaryOpKind,
         /// The left-hand side of the operator.
-        lhs: AstClassSetOp,
+        lhs: ast::ClassSetOp,
     },
 }
 
@@ -301,8 +319,49 @@ impl Parser {
     ///
     /// To set configuration options on the parser, use
     /// [`ParserBuilder`](struct.ParserBuilder.html).
-    pub fn new(pattern: &str) -> Parser {
-        ParserBuilder::new().build(pattern)
+    pub fn new() -> Parser {
+        ParserBuilder::new().build()
+    }
+
+    /// Parse the regular expression into an abstract syntax tree.
+    pub fn parse(&self, pattern: &str) -> Result<Ast> {
+        ParserI::new(self, pattern).parse()
+    }
+
+    /// Parse the regular expression and return an abstract syntax tree with
+    /// all of the comments found in the pattern.
+    pub fn parse_with_comments(
+        &self,
+        pattern: &str,
+    ) -> Result<ast::WithComments> {
+        ParserI::new(self, pattern).parse_with_comments()
+    }
+
+    /// Reset the internal state of a parser.
+    ///
+    /// This is called at the beginning of every parse. This prevents the
+    /// parser from running with inconsistent state (say, if a previous
+    /// invocation returned an error and the parser is reused).
+    fn reset(&self) {
+        // These settings should be in line with the construction
+        // in `ParserBuilder::build`.
+        self.pos.set(Position { offset: 0, line: 1, column: 1});
+        self.ignore_space.set(self.initial_ignore_space);
+        self.comments.borrow_mut().clear();
+        self.stack_group.borrow_mut().clear();
+        self.stack_class.borrow_mut().clear();
+    }
+}
+
+impl<P: Borrow<Parser>> ParserI<P> {
+    /// Build an internal parser from a parser configuration and a pattern.
+    fn new(parser: P, pattern: &str) -> ParserI<P> {
+        ParserI { pattern: pattern.to_string(), parser: parser }
+    }
+
+    /// Return a reference to the parser state.
+    fn parser(&self) -> &Parser {
+        self.parser.borrow()
     }
 
     /// Return the current offset of the parser.
@@ -310,26 +369,26 @@ impl Parser {
     /// The offset starts at `0` from the beginning of the regular expression
     /// pattern string.
     fn offset(&self) -> usize {
-        self.pos.get().offset
+        self.parser().pos.get().offset
     }
 
     /// Return the current line number of the parser.
     ///
     /// The line number starts at `1`.
     fn line(&self) -> usize {
-        self.pos.get().line
+        self.parser().pos.get().line
     }
 
     /// Return the current column of the parser.
     ///
     /// The column number starts at `1` and is reset whenever a `\n` is seen.
     fn column(&self) -> usize {
-        self.pos.get().column
+        self.parser().pos.get().column
     }
 
     /// Return whether the parser should ignore whitespace or not.
     fn ignore_space(&self) -> bool {
-        self.ignore_space.get()
+        self.parser().ignore_space.get()
     }
 
     /// Return the character at the current position of the parser.
@@ -362,7 +421,11 @@ impl Parser {
             column = column.checked_add(1).unwrap();
         }
         offset += self.char().len_utf8();
-        self.pos.set(Position { offset: offset, line: line, column: column });
+        self.parser().pos.set(Position {
+            offset: offset,
+            line: line,
+            column: column,
+        });
         self.pattern[self.offset()..].chars().next().is_some()
     }
 
@@ -435,11 +498,11 @@ impl Parser {
                     }
                     comment_text.push(c);
                 }
-                let comment = AstComment {
+                let comment = ast::Comment {
                     span: Span::new(start, self.pos()),
                     comment: comment_text,
                 };
-                self.comments.borrow_mut().push(comment);
+                self.parser().comments.borrow_mut().push(comment);
             } else {
                 break;
             }
@@ -464,7 +527,7 @@ impl Parser {
     /// Return the current position of the parser, which includes the offset,
     /// line and column.
     fn pos(&self) -> Position {
-        self.pos.get()
+        self.parser().pos.get()
     }
 
     /// Create a span at the current position of the parser. Both the start
@@ -496,12 +559,12 @@ impl Parser {
     ///
     /// This assumes the parser is currently positioned at `|` and will advance
     /// the parser to the character following `|`.
-    fn push_alternate(&self, mut concat: AstConcat) -> Result<AstConcat> {
+    fn push_alternate(&self, mut concat: ast::Concat) -> Result<ast::Concat> {
         assert_eq!(self.char(), '|');
         concat.span.end = self.pos();
         self.push_or_add_alternation(concat);
         self.bump();
-        Ok(AstConcat {
+        Ok(ast::Concat {
             span: self.span(),
             asts: vec![],
         })
@@ -509,15 +572,15 @@ impl Parser {
 
     /// Pushes or adds the given branch of an alternation to the parser's
     /// internal stack of state.
-    fn push_or_add_alternation(&self, concat: AstConcat) {
+    fn push_or_add_alternation(&self, concat: ast::Concat) {
         use self::GroupState::*;
 
-        let mut stack = self.stack_group.borrow_mut();
+        let mut stack = self.parser().stack_group.borrow_mut();
         if let Some(&mut Alternation(ref mut alts)) = stack.last_mut() {
             alts.asts.push(concat.into_ast());
             return;
         }
-        stack.push(Alternation(AstAlternation {
+        stack.push(Alternation(ast::Alternation {
             span: Span::new(concat.span.start, self.pos()),
             asts: vec![concat.into_ast()],
         }));
@@ -536,13 +599,13 @@ impl Parser {
     ///
     /// If there was a problem parsing the start of the group, then an error
     /// is returned.
-    fn push_group(&self, mut concat: AstConcat) -> Result<AstConcat> {
+    fn push_group(&self, mut concat: ast::Concat) -> Result<ast::Concat> {
         assert_eq!(self.char(), '(');
         match try!(self.parse_group()) {
             Either::Left(set) => {
-                let ignore = set.flags.flag_state(AstFlag::IgnoreWhitespace);
+                let ignore = set.flags.flag_state(ast::Flag::IgnoreWhitespace);
                 if let Some(v) = ignore {
-                    self.ignore_space.set(v);
+                    self.parser().ignore_space.set(v);
                 }
 
                 concat.asts.push(Ast::Flags(set));
@@ -552,15 +615,15 @@ impl Parser {
                 let old_ignore_space = self.ignore_space();
                 let new_ignore_space = group
                     .flags()
-                    .and_then(|f| f.flag_state(AstFlag::IgnoreWhitespace))
+                    .and_then(|f| f.flag_state(ast::Flag::IgnoreWhitespace))
                     .unwrap_or(old_ignore_space);
-                self.stack_group.borrow_mut().push(GroupState::Group {
+                self.parser().stack_group.borrow_mut().push(GroupState::Group {
                     concat: concat,
                     group: group,
                     ignore_space: old_ignore_space,
                 });
-                self.ignore_space.set(new_ignore_space);
-                Ok(AstConcat {
+                self.parser().ignore_space.set(new_ignore_space);
+                Ok(ast::Concat {
                     span: self.span(),
                     asts: vec![],
                 })
@@ -577,11 +640,11 @@ impl Parser {
     ///
     /// If no such group could be popped, then an unopened group error is
     /// returned.
-    fn pop_group(&self, mut group_concat: AstConcat) -> Result<AstConcat> {
+    fn pop_group(&self, mut group_concat: ast::Concat) -> Result<ast::Concat> {
         use self::GroupState::*;
 
         assert_eq!(self.char(), ')');
-        let mut stack = self.stack_group.borrow_mut();
+        let mut stack = self.parser().stack_group.borrow_mut();
         let (mut prior_concat, mut group, ignore_space, alt) =
             match stack.pop() {
                 Some(Group { concat, group, ignore_space }) => {
@@ -592,18 +655,18 @@ impl Parser {
                         Some(Group { concat, group, ignore_space }) => {
                             (concat, group, ignore_space, Some(alt))
                         }
-                        None | Some(Alternation(_)) => return Err(AstError {
+                        None | Some(Alternation(_)) => return Err(ast::Error {
                             span: self.span_char(),
-                            kind: AstErrorKind::GroupUnopened,
+                            kind: ast::ErrorKind::GroupUnopened,
                         }),
                     }
                 }
-                None => return Err(AstError {
+                None => return Err(ast::Error {
                     span: self.span_char(),
-                    kind: AstErrorKind::GroupUnopened,
+                    kind: ast::ErrorKind::GroupUnopened,
                 }),
             };
-        self.ignore_space.set(ignore_space);
+        self.parser().ignore_space.set(ignore_space);
         group_concat.span.end = self.pos();
         self.bump();
         group.span.end = self.pos();
@@ -627,9 +690,9 @@ impl Parser {
     /// error.
     ///
     /// This assumes that the parser has advanced to the end.
-    fn pop_group_end(&self, mut concat: AstConcat) -> Result<Ast> {
+    fn pop_group_end(&self, mut concat: ast::Concat) -> Result<Ast> {
         concat.span.end = self.pos();
-        let mut stack = self.stack_group.borrow_mut();
+        let mut stack = self.parser().stack_group.borrow_mut();
         let ast = match stack.pop() {
             None => Ok(concat.into_ast()),
             Some(GroupState::Alternation(mut alt)) => {
@@ -638,9 +701,9 @@ impl Parser {
                 Ok(Ast::Alternation(alt))
             }
             Some(GroupState::Group { group, .. }) => {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: group.span,
-                    kind: AstErrorKind::GroupUnclosed,
+                    kind: ast::ErrorKind::GroupUnclosed,
                 });
             }
         };
@@ -657,9 +720,9 @@ impl Parser {
                 unreachable!()
             }
             Some(GroupState::Group { group, .. }) => {
-                Err(AstError {
+                Err(ast::Error {
                     span: group.span,
-                    kind: AstErrorKind::GroupUnclosed,
+                    kind: ast::ErrorKind::GroupUnclosed,
                 })
             }
         }
@@ -675,12 +738,12 @@ impl Parser {
     /// returned (which may be populated with either a `]` or a `-`).
     fn push_class_open(
         &self,
-        parent_union: AstClassSetUnion,
-    ) -> Result<AstClassSetUnion> {
+        parent_union: ast::ClassSetUnion,
+    ) -> Result<ast::ClassSetUnion> {
         assert_eq!(self.char(), '[');
 
         let (nested_set, nested_union) = try!(self.parse_set_class_open());
-        self.stack_class.borrow_mut().push(ClassState::Open {
+        self.parser().stack_class.borrow_mut().push(ClassState::Open {
             union: parent_union,
             set: nested_set,
         });
@@ -703,12 +766,12 @@ impl Parser {
     /// then an error is returned.
     fn pop_class(
         &self,
-        nested_union: AstClassSetUnion,
-    ) -> Result<Either<AstClassSetUnion, AstClass>> {
+        nested_union: ast::ClassSetUnion,
+    ) -> Result<Either<ast::ClassSetUnion, ast::Class>> {
         assert_eq!(self.char(), ']');
 
-        let op = self.pop_class_op(AstClassSetOp::Union(nested_union));
-        let mut stack = self.stack_class.borrow_mut();
+        let op = self.pop_class_op(ast::ClassSetOp::Union(nested_union));
+        let mut stack = self.parser().stack_class.borrow_mut();
         match stack.pop() {
             None => {
                 // We can never observe an empty stack:
@@ -734,11 +797,11 @@ impl Parser {
                 self.bump();
                 set.span.end = self.pos();
                 set.op = op;
-                let class = AstClass::Set(set);
+                let class = ast::Class::Set(set);
                 if stack.is_empty() {
                     Ok(Either::Right(class))
                 } else {
-                    union.push(AstClassSetItem::Class(Box::new(class)));
+                    union.push(ast::ClassSetItem::Class(Box::new(class)));
                     Ok(Either::Left(union))
                 }
             }
@@ -749,13 +812,13 @@ impl Parser {
     /// recently opened class.
     ///
     /// This should only be called while parsing a character class.
-    fn unclosed_class_error(&self) -> AstError {
-        for state in self.stack_class.borrow().iter().rev() {
+    fn unclosed_class_error(&self) -> ast::Error {
+        for state in self.parser().stack_class.borrow().iter().rev() {
             match *state {
                 ClassState::Open { ref set, .. } => {
-                    return AstError {
+                    return ast::Error {
                         span: set.span,
-                        kind: AstErrorKind::ClassUnclosed,
+                        kind: ast::ErrorKind::ClassUnclosed,
                     };
                 }
                 _ => {}
@@ -773,16 +836,16 @@ impl Parser {
     /// hand side of this operator.
     fn push_class_op(
         &self,
-        next_kind: AstClassSetBinaryOpKind,
-        next_union: AstClassSetUnion,
-    ) -> AstClassSetUnion {
+        next_kind: ast::ClassSetBinaryOpKind,
+        next_union: ast::ClassSetUnion,
+    ) -> ast::ClassSetUnion {
 
-        let new_lhs = self.pop_class_op(AstClassSetOp::Union(next_union));
-        self.stack_class.borrow_mut().push(ClassState::Op {
+        let new_lhs = self.pop_class_op(ast::ClassSetOp::Union(next_union));
+        self.parser().stack_class.borrow_mut().push(ClassState::Op {
             kind: next_kind,
             lhs: new_lhs,
         });
-        AstClassSetUnion { span: self.span(), items: vec![] }
+        ast::ClassSetUnion { span: self.span(), items: vec![] }
     }
 
     /// Pop a character class operation from the character class parser stack.
@@ -790,8 +853,8 @@ impl Parser {
     /// unchanged. If the top of the stack is an operation, then the given
     /// op will be used as the rhs of the operation on the top of the stack.
     /// In that case, the binary operation is returned.
-    fn pop_class_op(&self, rhs: AstClassSetOp) -> AstClassSetOp {
-        let mut stack = self.stack_class.borrow_mut();
+    fn pop_class_op(&self, rhs: ast::ClassSetOp) -> ast::ClassSetOp {
+        let mut stack = self.parser().stack_class.borrow_mut();
         let (kind, lhs) = match stack.pop() {
             Some(ClassState::Op { kind, lhs }) => (kind, lhs),
             Some(state @ ClassState::Open { .. }) => {
@@ -801,7 +864,7 @@ impl Parser {
             None => unreachable!(),
         };
         let span = Span::new(lhs.span().start, rhs.span().end);
-        AstClassSetOp::BinaryOp(AstClassSetBinaryOp {
+        ast::ClassSetOp::BinaryOp(ast::ClassSetBinaryOp {
             span: span,
             kind: kind,
             lhs: Box::new(lhs),
@@ -810,17 +873,18 @@ impl Parser {
     }
 }
 
-impl Parser {
+impl<P: Borrow<Parser>> ParserI<P> {
     /// Parse the regular expression into an abstract syntax tree.
-    pub fn parse(&self) -> Result<Ast> {
+    fn parse(&self) -> Result<Ast> {
         self.parse_with_comments().map(|astc| astc.ast)
     }
 
     /// Parse the regular expression and return an abstract syntax tree with
     /// all of the comments found in the pattern.
-    pub fn parse_with_comments(&self) -> Result<AstWithComments> {
+    fn parse_with_comments(&self) -> Result<ast::WithComments> {
         assert_eq!(self.offset(), 0, "parser can only be used once");
-        let mut concat = AstConcat {
+        self.parser().reset();
+        let mut concat = ast::Concat {
             span: self.span(),
             asts: vec![],
         };
@@ -839,15 +903,15 @@ impl Parser {
                 }
                 '?' => {
                     concat = self.parse_uncounted_repetition(
-                        concat, AstRepetitionKind::ZeroOrOne);
+                        concat, ast::RepetitionKind::ZeroOrOne);
                 }
                 '*' => {
                     concat = self.parse_uncounted_repetition(
-                        concat, AstRepetitionKind::ZeroOrMore);
+                        concat, ast::RepetitionKind::ZeroOrMore);
                 }
                 '+' => {
                     concat = self.parse_uncounted_repetition(
-                        concat, AstRepetitionKind::OneOrMore);
+                        concat, ast::RepetitionKind::OneOrMore);
                 }
                 '{' => {
                     concat = try!(self.parse_counted_repetition(concat));
@@ -856,10 +920,13 @@ impl Parser {
             }
         }
         let ast = try!(self.pop_group_end(concat));
-        try!(error_if_nested(&ast, self.nest_limit, 0));
-        Ok(AstWithComments {
+        try!(error_if_nested(&ast, self.parser().nest_limit, 0));
+        Ok(ast::WithComments {
             ast: ast,
-            comments: mem::replace(&mut *self.comments.borrow_mut(), vec![]),
+            comments: mem::replace(
+                &mut *self.parser().comments.borrow_mut(),
+                vec![],
+            ),
         })
     }
 
@@ -878,9 +945,9 @@ impl Parser {
     /// last expression in the given concatenation.
     fn parse_uncounted_repetition(
         &self,
-        mut concat: AstConcat,
-        kind: AstRepetitionKind,
-    ) -> AstConcat {
+        mut concat: ast::Concat,
+        kind: ast::RepetitionKind,
+    ) -> ast::Concat {
         assert!(
             self.char() == '?' || self.char() == '*' || self.char() == '+');
         let op_start = self.pos();
@@ -893,9 +960,9 @@ impl Parser {
             greedy = false;
             self.bump();
         }
-        concat.asts.push(Ast::Repetition(AstRepetition {
+        concat.asts.push(Ast::Repetition(ast::Repetition {
             span: ast.span().with_end(self.pos()),
-            op: AstRepetitionOp {
+            op: ast::RepetitionOp {
                 span: Span::new(op_start, self.pos()),
                 kind: kind,
             },
@@ -919,8 +986,8 @@ impl Parser {
     /// last expression in the given concatenation.
     fn parse_counted_repetition(
         &self,
-        mut concat: AstConcat,
-    ) -> Result<AstConcat> {
+        mut concat: ast::Concat,
+    ) -> Result<ast::Concat> {
         assert!(self.char() == '{');
         let start = self.pos();
         let ast = match concat.asts.pop() {
@@ -928,37 +995,37 @@ impl Parser {
             Some(ast) => ast,
         };
         if !self.bump() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(start, self.pos()),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             });
         }
         let count_start = try!(self.parse_decimal());
-        let mut range = AstRepetitionRange::Exactly(count_start);
+        let mut range = ast::RepetitionRange::Exactly(count_start);
         if self.is_eof() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(start, self.pos()),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             });
         }
         if self.char() == ',' {
             if !self.bump() {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: Span::new(start, self.pos()),
-                    kind: AstErrorKind::CountedRepetitionUnclosed,
+                    kind: ast::ErrorKind::CountedRepetitionUnclosed,
                 });
             }
             if self.char() != '}' {
                 let count_end = try!(self.parse_decimal());
-                range = AstRepetitionRange::Bounded(count_start, count_end);
+                range = ast::RepetitionRange::Bounded(count_start, count_end);
             } else {
-                range = AstRepetitionRange::AtLeast(count_start);
+                range = ast::RepetitionRange::AtLeast(count_start);
             }
         }
         if self.is_eof() || self.char() != '}' {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(start, self.pos()),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             });
         }
 
@@ -967,11 +1034,11 @@ impl Parser {
             greedy = false;
             self.bump();
         }
-        concat.asts.push(Ast::Repetition(AstRepetition {
+        concat.asts.push(Ast::Repetition(ast::Repetition {
             span: ast.span().with_end(self.pos()),
-            op: AstRepetitionOp {
+            op: ast::RepetitionOp {
                 span: Span::new(start, self.pos()),
-                kind: AstRepetitionKind::Range(range),
+                kind: ast::RepetitionKind::Range(range),
             },
             greedy: greedy,
             ast: Box::new(ast),
@@ -997,22 +1064,22 @@ impl Parser {
     ///
     /// If a capture name is given and it is incorrectly specified, then a
     /// corresponding error is returned.
-    fn parse_group(&self) -> Result<Either<AstSetFlags, AstGroup>> {
+    fn parse_group(&self) -> Result<Either<ast::SetFlags, ast::Group>> {
         assert_eq!(self.char(), '(');
         let open_span = self.span_char();
         self.bump();
         self.bump_space();
         if self.is_lookaround_prefix() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(open_span.start, self.span().end),
-                kind: AstErrorKind::UnsupportedLookAround,
+                kind: ast::ErrorKind::UnsupportedLookAround,
             });
         }
         if self.bump_if("?P<") {
             let cap = try!(self.parse_capture_name());
-            Ok(Either::Right(AstGroup {
+            Ok(Either::Right(ast::Group {
                 span: open_span,
-                kind: AstGroupKind::CaptureName(cap),
+                kind: ast::GroupKind::CaptureName(cap),
                 ast: Box::new(Ast::Empty(self.span())),
             }))
         } else if self.bump_if("?") {
@@ -1020,22 +1087,22 @@ impl Parser {
             let char_end = self.char();
             self.bump();
             if char_end == ')' {
-                Ok(Either::Left(AstSetFlags {
+                Ok(Either::Left(ast::SetFlags {
                     span: Span { end: self.pos(), ..open_span },
                     flags: flags,
                 }))
             } else {
                 assert_eq!(char_end, ':');
-                Ok(Either::Right(AstGroup {
+                Ok(Either::Right(ast::Group {
                     span: open_span,
-                    kind: AstGroupKind::NonCapturing(flags),
+                    kind: ast::GroupKind::NonCapturing(flags),
                     ast: Box::new(Ast::Empty(self.span())),
                 }))
             }
         } else {
-            Ok(Either::Right(AstGroup {
+            Ok(Either::Right(ast::Group {
                 span: open_span,
-                kind: AstGroupKind::CaptureIndex,
+                kind: ast::GroupKind::CaptureIndex,
                 ast: Box::new(Ast::Empty(self.span())),
             }))
         }
@@ -1045,11 +1112,11 @@ impl Parser {
     /// the first character in the name following the opening `<` (and may
     /// possibly be EOF). This advances the parser to the first character
     /// following the closing `>`.
-    fn parse_capture_name(&self) -> Result<AstCaptureName> {
+    fn parse_capture_name(&self) -> Result<ast::CaptureName> {
         if self.is_eof() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: self.span(),
-                kind: AstErrorKind::GroupNameUnexpectedEof,
+                kind: ast::ErrorKind::GroupNameUnexpectedEof,
             });
         }
         let start = self.pos();
@@ -1058,9 +1125,9 @@ impl Parser {
                 break;
             }
             if !is_capture_char(self.char(), self.pos() == start) {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: self.span_char(),
-                    kind: AstErrorKind::GroupNameInvalid { c: self.char() },
+                    kind: ast::ErrorKind::GroupNameInvalid { c: self.char() },
                 });
             }
             if !self.bump() {
@@ -1069,21 +1136,21 @@ impl Parser {
         }
         let end = self.pos();
         if self.is_eof() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: self.span(),
-                kind: AstErrorKind::GroupNameUnexpectedEof,
+                kind: ast::ErrorKind::GroupNameUnexpectedEof,
             });
         }
         assert_eq!(self.char(), '>');
         self.bump();
         let name = &self.pattern[start.offset..end.offset];
         if name.is_empty() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(start, start),
-                kind: AstErrorKind::GroupNameEmpty,
+                kind: ast::ErrorKind::GroupNameEmpty,
             });
         }
-        Ok(AstCaptureName {
+        Ok(ast::CaptureName {
             span: Span::new(start, end),
             name: name.to_string(),
         })
@@ -1103,34 +1170,34 @@ impl Parser {
     ///
     /// If no flags could be found or if the negation operation is not followed
     /// by any flags, then an error is returned.
-    fn parse_flags(&self) -> Result<AstFlags> {
-        let mut flags = AstFlags {
+    fn parse_flags(&self) -> Result<ast::Flags> {
+        let mut flags = ast::Flags {
             span: self.span(),
             items: vec![],
         };
         while self.char() != ':' && self.char() != ')' {
             if self.char() == '-' {
-                let item = AstFlagsItem {
+                let item = ast::FlagsItem {
                     span: self.span_char(),
-                    kind: AstFlagsItemKind::Negation,
+                    kind: ast::FlagsItemKind::Negation,
                 };
                 if let Some(i) = flags.add_item(item) {
-                    return Err(AstError {
+                    return Err(ast::Error {
                         span: self.span_char(),
-                        kind: AstErrorKind::FlagRepeatedNegation {
+                        kind: ast::ErrorKind::FlagRepeatedNegation {
                             original: flags.items[i].span,
                         },
                     });
                 }
             } else {
-                let item = AstFlagsItem {
+                let item = ast::FlagsItem {
                     span: self.span_char(),
-                    kind: AstFlagsItemKind::Flag(try!(self.parse_flag())),
+                    kind: ast::FlagsItemKind::Flag(try!(self.parse_flag())),
                 };
                 if let Some(i) = flags.add_item(item) {
-                    return Err(AstError {
+                    return Err(ast::Error {
                         span: self.span_char(),
-                        kind: AstErrorKind::FlagDuplicate {
+                        kind: ast::ErrorKind::FlagDuplicate {
                             flag: self.char(),
                             original: flags.items[i].span,
                         },
@@ -1138,9 +1205,9 @@ impl Parser {
                 }
             }
             if !self.bump() {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: self.span(),
-                    kind: AstErrorKind::FlagUnexpectedEof,
+                    kind: ast::ErrorKind::FlagUnexpectedEof,
                 });
             }
         }
@@ -1153,17 +1220,17 @@ impl Parser {
     /// # Errors
     ///
     /// If the flag is not recognized, then an error is returned.
-    fn parse_flag(&self) -> Result<AstFlag> {
+    fn parse_flag(&self) -> Result<ast::Flag> {
         match self.char() {
-            'i' => Ok(AstFlag::CaseInsensitive),
-            'm' => Ok(AstFlag::MultiLine),
-            's' => Ok(AstFlag::DotMatchesNewLine),
-            'U' => Ok(AstFlag::SwapGreed),
-            'u' => Ok(AstFlag::Unicode),
-            'x' => Ok(AstFlag::IgnoreWhitespace),
-            c => Err(AstError {
+            'i' => Ok(ast::Flag::CaseInsensitive),
+            'm' => Ok(ast::Flag::MultiLine),
+            's' => Ok(ast::Flag::DotMatchesNewLine),
+            'U' => Ok(ast::Flag::SwapGreed),
+            'u' => Ok(ast::Flag::Unicode),
+            'x' => Ok(ast::Flag::IgnoreWhitespace),
+            c => Err(ast::Error {
                 span: self.span_char(),
-                kind: AstErrorKind::FlagUnrecognized { flag: c },
+                kind: ast::ErrorKind::FlagUnrecognized { flag: c },
             }),
         }
     }
@@ -1187,25 +1254,25 @@ impl Parser {
                 Ok(ast)
             }
             '^' => {
-                let ast = Primitive::Assertion(AstAssertion {
+                let ast = Primitive::Assertion(ast::Assertion {
                     span: self.span_char(),
-                    kind: AstAssertionKind::StartLine,
+                    kind: ast::AssertionKind::StartLine,
                 });
                 self.bump();
                 Ok(ast)
             }
             '$' => {
-                let ast = Primitive::Assertion(AstAssertion {
+                let ast = Primitive::Assertion(ast::Assertion {
                     span: self.span_char(),
-                    kind: AstAssertionKind::EndLine,
+                    kind: ast::AssertionKind::EndLine,
                 });
                 self.bump();
                 Ok(ast)
             }
             c => {
-                let ast = Primitive::Literal(AstLiteral {
+                let ast = Primitive::Literal(ast::Literal {
                     span: self.span_char(),
-                    kind: AstLiteralKind::Verbatim,
+                    kind: ast::LiteralKind::Verbatim,
                     c: c,
                 });
                 self.bump();
@@ -1223,29 +1290,29 @@ impl Parser {
         assert_eq!(self.char(), '\\');
         let start = self.pos();
         if !self.bump() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(start, self.pos()),
-                kind: AstErrorKind::EscapeUnexpectedEof,
+                kind: ast::ErrorKind::EscapeUnexpectedEof,
             });
         }
         let c = self.char();
         // Put some of the more complicated routines into helpers.
         match c {
             '0'...'7' => {
-                if !self.octal {
-                    return Err(AstError {
+                if !self.parser().octal {
+                    return Err(ast::Error {
                         span: Span::new(start, self.span_char().end),
-                        kind: AstErrorKind::UnsupportedBackreference,
+                        kind: ast::ErrorKind::UnsupportedBackreference,
                     });
                 }
                 let mut lit = self.parse_octal();
                 lit.span.start = start;
                 return Ok(Primitive::Literal(lit));
             }
-            '8'...'9' if !self.octal => {
-                return Err(AstError {
+            '8'...'9' if !self.parser().octal => {
+                return Err(ast::Error {
                     span: Span::new(start, self.span_char().end),
-                    kind: AstErrorKind::UnsupportedBackreference,
+                    kind: ast::ErrorKind::UnsupportedBackreference,
                 });
             }
             'x' | 'u' | 'U' => {
@@ -1270,46 +1337,46 @@ impl Parser {
         self.bump();
         let span = Span::new(start, self.pos());
         if is_punct(c) {
-            return Ok(Primitive::Literal(AstLiteral {
+            return Ok(Primitive::Literal(ast::Literal {
                 span: span,
-                kind: AstLiteralKind::Punctuation,
+                kind: ast::LiteralKind::Punctuation,
                 c: c,
             }));
         }
-        let special = |kind, c| Ok(Primitive::Literal(AstLiteral {
+        let special = |kind, c| Ok(Primitive::Literal(ast::Literal {
             span: span,
-            kind: AstLiteralKind::Special(kind),
+            kind: ast::LiteralKind::Special(kind),
             c: c,
         }));
         match c {
-            'a' => special(AstSpecialLiteralKind::Bell, '\x07'),
-            'f' => special(AstSpecialLiteralKind::FormFeed, '\x0C'),
-            't' => special(AstSpecialLiteralKind::Tab, '\t'),
-            'n' => special(AstSpecialLiteralKind::LineFeed, '\n'),
-            'r' => special(AstSpecialLiteralKind::CarriageReturn, '\r'),
-            'v' => special(AstSpecialLiteralKind::VerticalTab, '\x0B'),
+            'a' => special(ast::SpecialLiteralKind::Bell, '\x07'),
+            'f' => special(ast::SpecialLiteralKind::FormFeed, '\x0C'),
+            't' => special(ast::SpecialLiteralKind::Tab, '\t'),
+            'n' => special(ast::SpecialLiteralKind::LineFeed, '\n'),
+            'r' => special(ast::SpecialLiteralKind::CarriageReturn, '\r'),
+            'v' => special(ast::SpecialLiteralKind::VerticalTab, '\x0B'),
             ' ' if self.ignore_space() => {
-                special(AstSpecialLiteralKind::Space, ' ')
+                special(ast::SpecialLiteralKind::Space, ' ')
             }
-            'A' => Ok(Primitive::Assertion(AstAssertion {
+            'A' => Ok(Primitive::Assertion(ast::Assertion {
                 span: span,
-                kind: AstAssertionKind::StartText,
+                kind: ast::AssertionKind::StartText,
             })),
-            'z' => Ok(Primitive::Assertion(AstAssertion {
+            'z' => Ok(Primitive::Assertion(ast::Assertion {
                 span: span,
-                kind: AstAssertionKind::EndText,
+                kind: ast::AssertionKind::EndText,
             })),
-            'b' => Ok(Primitive::Assertion(AstAssertion {
+            'b' => Ok(Primitive::Assertion(ast::Assertion {
                 span: span,
-                kind: AstAssertionKind::WordBoundary,
+                kind: ast::AssertionKind::WordBoundary,
             })),
-            'B' => Ok(Primitive::Assertion(AstAssertion {
+            'B' => Ok(Primitive::Assertion(ast::Assertion {
                 span: span,
-                kind: AstAssertionKind::NotWordBoundary,
+                kind: ast::AssertionKind::NotWordBoundary,
             })),
-            c => Err(AstError {
+            c => Err(ast::Error {
                 span: span,
-                kind: AstErrorKind::EscapeUnrecognized { c: c },
+                kind: ast::ErrorKind::EscapeUnrecognized { c: c },
             }),
         }
     }
@@ -1321,11 +1388,11 @@ impl Parser {
     /// escapes is enabled.
     ///
     /// Assuming the preconditions are met, this routine can never fail.
-    fn parse_octal(&self) -> AstLiteral {
+    fn parse_octal(&self) -> ast::Literal {
         use std::char;
         use std::u32;
 
-        assert!(self.octal);
+        assert!(self.parser().octal);
         assert!('0' <= self.char() && self.char() <= '7');
         let start = self.pos();
         // Parse up to two more digits.
@@ -1343,9 +1410,9 @@ impl Parser {
         // The max value for 3 digit octal is 0777 = 511 and [0, 511] has no
         // invalid Unicode scalar values.
         let c = char::from_u32(codepoint).expect("Unicode scalar value");
-        AstLiteral {
+        ast::Literal {
             span: Span::new(start, end),
-            kind: AstLiteralKind::Octal,
+            kind: ast::LiteralKind::Octal,
             c: c,
         }
     }
@@ -1354,20 +1421,20 @@ impl Parser {
     /// hex notations, i.e., `\xFF` and `\x{FFFF}`. This expects the parser to
     /// be positioned at the `x`, `u` or `U` prefix. The parser is advanced to
     /// the first character immediately following the hexadecimal literal.
-    fn parse_hex(&self) -> Result<AstLiteral> {
+    fn parse_hex(&self) -> Result<ast::Literal> {
         assert!(self.char() == 'x'
                 || self.char() == 'u'
                 || self.char() == 'U');
 
         let hex_kind = match self.char() {
-            'x' => AstHexLiteralKind::X,
-            'u' => AstHexLiteralKind::UnicodeShort,
-            _ => AstHexLiteralKind::UnicodeLong,
+            'x' => ast::HexLiteralKind::X,
+            'u' => ast::HexLiteralKind::UnicodeShort,
+            _ => ast::HexLiteralKind::UnicodeLong,
         };
         if !self.bump() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: self.span(),
-                kind: AstErrorKind::EscapeUnexpectedEof,
+                kind: ast::ErrorKind::EscapeUnexpectedEof,
             });
         }
         if self.char() == '{' {
@@ -1384,22 +1451,22 @@ impl Parser {
     ///
     /// The number of digits given must be 2 (for `\xNN`), 4 (for `\uNNNN`)
     /// or 8 (for `\UNNNNNNNN`).
-    fn parse_hex_digits(&self, kind: AstHexLiteralKind) -> Result<AstLiteral> {
+    fn parse_hex_digits(&self, kind: ast::HexLiteralKind) -> Result<ast::Literal> {
         use std::char;
         use std::u32;
 
         let start = self.pos();
         for i in 0..kind.digits() {
             if i > 0 && !self.bump() {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: self.span(),
-                    kind: AstErrorKind::EscapeUnexpectedEof,
+                    kind: ast::ErrorKind::EscapeUnexpectedEof,
                 });
             }
             if !is_hex(self.char()) {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: self.span_char(),
-                    kind: AstErrorKind::EscapeHexInvalidDigit {
+                    kind: ast::ErrorKind::EscapeHexInvalidDigit {
                         c: self.char(),
                     },
                 });
@@ -1411,13 +1478,13 @@ impl Parser {
         let end = self.pos();
         let hex = &self.pattern[start.offset..end.offset];
         match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
-            None => Err(AstError {
+            None => Err(ast::Error {
                 span: Span::new(start, end),
-                kind: AstErrorKind::EscapeHexInvalid,
+                kind: ast::ErrorKind::EscapeHexInvalid,
             }),
-            Some(c) => Ok(AstLiteral {
+            Some(c) => Ok(ast::Literal {
                 span: Span::new(start, end),
-                kind: AstLiteralKind::HexFixed(kind),
+                kind: ast::LiteralKind::HexFixed(kind),
                 c: c,
             }),
         }
@@ -1426,7 +1493,7 @@ impl Parser {
     /// Parse a hex representation of any Unicode scalar value. This expects
     /// the parser to be positioned at the opening brace `{` and will advance
     /// the parser to the first character following the closing brace `}`.
-    fn parse_hex_brace(&self, kind: AstHexLiteralKind) -> Result<AstLiteral> {
+    fn parse_hex_brace(&self, kind: ast::HexLiteralKind) -> Result<ast::Literal> {
         use std::char;
         use std::u32;
 
@@ -1434,18 +1501,18 @@ impl Parser {
         let start = self.span_char().end;
         while self.bump() && self.char() != '}' {
             if !is_hex(self.char()) {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: self.span_char(),
-                    kind: AstErrorKind::EscapeHexInvalidDigit {
+                    kind: ast::ErrorKind::EscapeHexInvalidDigit {
                         c: self.char(),
                     },
                 });
             }
         }
         if self.is_eof() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(brace_pos, self.pos()),
-                kind: AstErrorKind::EscapeUnexpectedEof,
+                kind: ast::ErrorKind::EscapeUnexpectedEof,
             })
         }
         let end = self.pos();
@@ -1454,19 +1521,19 @@ impl Parser {
         self.bump();
 
         if hex.is_empty() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(brace_pos, self.pos()),
-                kind: AstErrorKind::EscapeHexEmpty,
+                kind: ast::ErrorKind::EscapeHexEmpty,
             })
         }
         match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
-            None => Err(AstError {
+            None => Err(ast::Error {
                 span: Span::new(start, end),
-                kind: AstErrorKind::EscapeHexInvalid,
+                kind: ast::ErrorKind::EscapeHexInvalid,
             }),
-            Some(c) => Ok(AstLiteral {
+            Some(c) => Ok(ast::Literal {
                 span: Span::new(start, self.pos()),
-                kind: AstLiteralKind::HexBrace(kind),
+                kind: ast::LiteralKind::HexBrace(kind),
                 c: c,
             }),
         }
@@ -1495,16 +1562,16 @@ impl Parser {
         }
         let digits = &self.pattern[span.start.offset..span.end.offset];
         if digits.is_empty() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: span,
-                kind: AstErrorKind::DecimalEmpty,
+                kind: ast::ErrorKind::DecimalEmpty,
             });
         }
         match u32::from_str_radix(digits, 10).ok() {
             Some(n) => Ok(n),
-            None => Err(AstError {
+            None => Err(ast::Error {
                 span: span,
-                kind: AstErrorKind::DecimalInvalid,
+                kind: ast::ErrorKind::DecimalInvalid,
             }),
         }
     }
@@ -1516,10 +1583,10 @@ impl Parser {
     /// This assumes the parser is positioned at the opening `[`. If parsing
     /// is successful, then the parser is advanced to the position immediately
     /// following the closing `]`.
-    fn parse_set_class(&self) -> Result<AstClass> {
+    fn parse_set_class(&self) -> Result<ast::Class> {
         assert_eq!(self.char(), '[');
 
-        let mut union = AstClassSetUnion { span: self.span(), items: vec![] };
+        let mut union = ast::ClassSetUnion { span: self.span(), items: vec![] };
         loop {
             self.bump_space();
             if self.is_eof() {
@@ -1531,9 +1598,9 @@ impl Parser {
                     // attempt to treat this as the beginning of an ASCII
                     // class. If ASCII class parsing fails, then the parser
                     // backs up to `[`.
-                    if !self.stack_class.borrow().is_empty() {
+                    if !self.parser().stack_class.borrow().is_empty() {
                         if let Some(cls) = self.maybe_parse_ascii_class() {
-                            union.push(AstClassSetItem::Ascii(cls));
+                            union.push(ast::ClassSetItem::Ascii(cls));
                             continue;
                         }
                     }
@@ -1548,17 +1615,17 @@ impl Parser {
                 '&' if self.peek() == Some('&') => {
                     assert!(self.bump_if("&&"));
                     union = self.push_class_op(
-                        AstClassSetBinaryOpKind::Intersection, union);
+                        ast::ClassSetBinaryOpKind::Intersection, union);
                 }
                 '-' if self.peek() == Some('-') => {
                     assert!(self.bump_if("--"));
                     union = self.push_class_op(
-                        AstClassSetBinaryOpKind::Difference, union);
+                        ast::ClassSetBinaryOpKind::Difference, union);
                 }
                 '~' if self.peek() == Some('~') => {
                     assert!(self.bump_if("~~"));
                     union = self.push_class_op(
-                        AstClassSetBinaryOpKind::SymmetricDifference, union);
+                        ast::ClassSetBinaryOpKind::SymmetricDifference, union);
                 }
                 _ => {
                     union.push(try!(self.parse_set_class_range()));
@@ -1575,7 +1642,7 @@ impl Parser {
     /// If an invalid escape is found, or if a character class is found where
     /// a simple literal is expected (e.g., in a range), then an error is
     /// returned.
-    fn parse_set_class_range(&self) -> Result<AstClassSetItem> {
+    fn parse_set_class_range(&self) -> Result<ast::ClassSetItem> {
         let prim1 = try!(self.parse_set_class_item());
         self.bump_space();
         if self.is_eof() {
@@ -1598,7 +1665,7 @@ impl Parser {
             return Err(self.unclosed_class_error());
         }
         let prim2 = try!(self.parse_set_class_item());
-        Ok(AstClassSetItem::Range(AstClassSetRange {
+        Ok(ast::ClassSetItem::Range(ast::ClassSetRange {
             span: Span::new(prim1.span().start, prim2.span().end),
             start: try!(prim1.into_class_literal()),
             end: try!(prim2.into_class_literal()),
@@ -1619,9 +1686,9 @@ impl Parser {
         if self.char() == '\\' {
             self.parse_escape()
         } else {
-            let x = Primitive::Literal(AstLiteral {
+            let x = Primitive::Literal(ast::Literal {
                 span: self.span_char(),
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: self.char(),
             });
             self.bump();
@@ -1637,7 +1704,7 @@ impl Parser {
     /// characters not equal to `]`. (`]` would need to be escaped in any other
     /// position.) Similarly for `-`.
     ///
-    /// In all cases, the op inside the returned `AstClassSet` is an empty
+    /// In all cases, the op inside the returned `ast::ClassSet` is an empty
     /// union. This empty union should be replaced with the actual op when
     /// it is popped from the parser's stack.
     ///
@@ -1645,13 +1712,13 @@ impl Parser {
     /// the parser to the first non-special byte of the character class.
     ///
     /// An error is returned if EOF is found.
-    fn parse_set_class_open(&self) -> Result<(AstClassSet, AstClassSetUnion)> {
+    fn parse_set_class_open(&self) -> Result<(ast::ClassSet, ast::ClassSetUnion)> {
         assert_eq!(self.char(), '[');
         let start = self.pos();
         if !self.bump_and_bump_space() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: Span::new(start, self.pos()),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             });
         }
 
@@ -1660,47 +1727,47 @@ impl Parser {
                 false
             } else {
                 if !self.bump_and_bump_space() {
-                    return Err(AstError {
+                    return Err(ast::Error {
                         span: Span::new(start, self.pos()),
-                        kind: AstErrorKind::ClassUnclosed,
+                        kind: ast::ErrorKind::ClassUnclosed,
                     });
                 }
                 true
             };
         // Accept any number of `-` as literal `-`.
-        let mut union = AstClassSetUnion { span: self.span(), items: vec![] };
+        let mut union = ast::ClassSetUnion { span: self.span(), items: vec![] };
         while self.char() == '-' {
-            union.push(AstClassSetItem::Literal(AstLiteral {
+            union.push(ast::ClassSetItem::Literal(ast::Literal {
                 span: self.span_char(),
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: '-',
             }));
             if !self.bump_and_bump_space() {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: Span::new(start, self.pos()),
-                    kind: AstErrorKind::ClassUnclosed,
+                    kind: ast::ErrorKind::ClassUnclosed,
                 });
             }
         }
         // If `]` is the *first* char in a set, then interpret it as a literal
         // `]`. That is, an empty class is impossible to write.
         if union.items.is_empty() && self.char() == ']' {
-            union.push(AstClassSetItem::Literal(AstLiteral {
+            union.push(ast::ClassSetItem::Literal(ast::Literal {
                 span: self.span_char(),
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: ']',
             }));
             if !self.bump_and_bump_space() {
-                return Err(AstError {
+                return Err(ast::Error {
                     span: Span::new(start, self.pos()),
-                    kind: AstErrorKind::ClassUnclosed,
+                    kind: ast::ErrorKind::ClassUnclosed,
                 });
             }
         }
-        let set = AstClassSet {
+        let set = ast::ClassSet {
             span: Span::new(start, self.pos()),
             negated: negated,
-            op: AstClassSetOp::Union(AstClassSetUnion {
+            op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                 span: Span::new(union.span.start, union.span.start),
                 items: vec![],
             }),
@@ -1716,7 +1783,7 @@ impl Parser {
     /// advance the parser and `None` is returned. Otherwise, the parser is
     /// advanced to the first byte following the closing `]` and the
     /// corresponding ASCII class is returned.
-    fn maybe_parse_ascii_class(&self) -> Option<AstClassAscii> {
+    fn maybe_parse_ascii_class(&self) -> Option<ast::ClassAscii> {
         // ASCII character classes are interesting from a parsing perspective
         // because parsing cannot fail with any interesting error. For example,
         // in order to use an ASCII character class, it must be enclosed in
@@ -1741,39 +1808,39 @@ impl Parser {
         let start = self.pos();
         let mut negated = false;
         if !self.bump() || self.char() != ':' {
-            self.pos.set(start);
+            self.parser().pos.set(start);
             return None;
         }
         if !self.bump() {
-            self.pos.set(start);
+            self.parser().pos.set(start);
             return None;
         }
         if self.char() == '^' {
             negated = true;
             if !self.bump() {
-                self.pos.set(start);
+                self.parser().pos.set(start);
                 return None;
             }
         }
         let name_start = self.offset();
         while self.char() != ':' && self.bump() {}
         if self.is_eof() {
-            self.pos.set(start);
+            self.parser().pos.set(start);
             return None;
         }
         let name = &self.pattern[name_start..self.offset()];
         if !self.bump_if(":]") {
-            self.pos.set(start);
+            self.parser().pos.set(start);
             return None;
         }
-        let kind = match AstClassAsciiKind::from_name(name) {
+        let kind = match ast::ClassAsciiKind::from_name(name) {
             Some(kind) => kind,
             None => {
-                self.pos.set(start);
+                self.parser().pos.set(start);
                 return None;
             }
         };
-        Some(AstClassAscii {
+        Some(ast::ClassAscii {
             span: Span::new(start, self.pos()),
             kind: kind,
             negated: negated,
@@ -1786,13 +1853,13 @@ impl Parser {
     /// advance the parser to the character immediately following the class.
     ///
     /// Note that this does not check whether the class name is valid or not.
-    fn parse_unicode_class(&self) -> Result<AstClassUnicode> {
+    fn parse_unicode_class(&self) -> Result<ast::ClassUnicode> {
         assert!(self.char() == 'p' || self.char() == 'P');
         let negated = self.char() == 'P';
         if !self.bump() {
-            return Err(AstError {
+            return Err(ast::Error {
                 span: self.span(),
-                kind: AstErrorKind::EscapeUnexpectedEof,
+                kind: ast::ErrorKind::EscapeUnexpectedEof,
             });
         }
         let (start, kind) =
@@ -1800,9 +1867,9 @@ impl Parser {
                 let start = self.span_char().end;
                 while self.bump() && self.char() != '}' {}
                 if self.is_eof() {
-                    return Err(AstError {
+                    return Err(ast::Error {
                         span: self.span(),
-                        kind: AstErrorKind::EscapeUnexpectedEof,
+                        kind: ast::ErrorKind::EscapeUnexpectedEof,
                     });
                 }
                 assert_eq!(self.char(), '}');
@@ -1811,33 +1878,33 @@ impl Parser {
 
                 let name = &self.pattern[start.offset..end.offset];
                 if let Some(i) = name.find("!=") {
-                    (start, AstClassUnicodeKind::NamedValue {
-                        op: AstClassUnicodeOpKind::NotEqual,
+                    (start, ast::ClassUnicodeKind::NamedValue {
+                        op: ast::ClassUnicodeOpKind::NotEqual,
                         name: name[..i].to_string(),
                         value: name[i+2..].to_string(),
                     })
                 } else if let Some(i) = name.find(':') {
-                    (start, AstClassUnicodeKind::NamedValue {
-                        op: AstClassUnicodeOpKind::Colon,
+                    (start, ast::ClassUnicodeKind::NamedValue {
+                        op: ast::ClassUnicodeOpKind::Colon,
                         name: name[..i].to_string(), value: name[i+1..].to_string(),
                     })
                 } else if let Some(i) = name.find('=') {
-                    (start, AstClassUnicodeKind::NamedValue {
-                        op: AstClassUnicodeOpKind::Equal,
+                    (start, ast::ClassUnicodeKind::NamedValue {
+                        op: ast::ClassUnicodeOpKind::Equal,
                         name: name[..i].to_string(),
                         value: name[i+1..].to_string(),
                     })
                 } else {
-                    (start, AstClassUnicodeKind::Named(name.to_string()))
+                    (start, ast::ClassUnicodeKind::Named(name.to_string()))
                 }
             } else {
                 let start = self.pos();
                 let c = self.char();
                 self.bump();
-                let kind = AstClassUnicodeKind::OneLetter(c);
+                let kind = ast::ClassUnicodeKind::OneLetter(c);
                 (start, kind)
             };
-        Ok(AstClassUnicode {
+        Ok(ast::ClassUnicode {
             span: Span::new(start, self.pos()),
             negated: negated,
             kind: kind,
@@ -1847,20 +1914,20 @@ impl Parser {
     /// Parse a Perl character class, e.g., `\d` or `\W`. This assumes the
     /// parser is currently at a valid character class name and will be
     /// advanced to the character immediately following the class.
-    fn parse_perl_class(&self) -> AstClassPerl {
+    fn parse_perl_class(&self) -> ast::ClassPerl {
         let c = self.char();
         let span = self.span_char();
         self.bump();
         let (negated, kind) = match c {
-            'd' => (false, AstClassPerlKind::Digit),
-            'D' => (true, AstClassPerlKind::Digit),
-            's' => (false, AstClassPerlKind::Space),
-            'S' => (true, AstClassPerlKind::Space),
-            'w' => (false, AstClassPerlKind::Word),
-            'W' => (true, AstClassPerlKind::Word),
+            'd' => (false, ast::ClassPerlKind::Digit),
+            'D' => (true, ast::ClassPerlKind::Digit),
+            's' => (false, ast::ClassPerlKind::Space),
+            'S' => (true, ast::ClassPerlKind::Space),
+            'w' => (false, ast::ClassPerlKind::Word),
+            'W' => (true, ast::ClassPerlKind::Word),
             c => panic!("expected valid Perl class but got '{}'", c),
         };
-        AstClassPerl { span: span, kind: kind, negated: negated }
+        ast::ClassPerl { span: span, kind: kind, negated: negated }
     }
 }
 
@@ -1871,9 +1938,9 @@ fn error_if_nested(
     depth: u32,
 ) -> Result<()> {
     if depth >= limit {
-        return Err(AstError {
+        return Err(ast::Error {
             span: *ast.span(),
-            kind: AstErrorKind::NestLimitExceeded(limit),
+            kind: ast::ErrorKind::NestLimitExceeded(limit),
         });
     }
     match *ast {
@@ -1887,20 +1954,20 @@ fn error_if_nested(
         Ast::Class(ref cls) => {
             error_if_nested_class(cls, limit, depth)
         }
-        Ast::Repetition(AstRepetition { ref ast, .. }) => {
+        Ast::Repetition(ast::Repetition { ref ast, .. }) => {
             error_if_nested(ast, limit, depth.checked_add(1).unwrap())
         }
-        Ast::Group(AstGroup { ref ast, .. }) => {
+        Ast::Group(ast::Group { ref ast, .. }) => {
             error_if_nested(ast, limit, depth.checked_add(1).unwrap())
         }
-        Ast::Alternation(AstAlternation { ref asts, .. }) => {
+        Ast::Alternation(ast::Alternation { ref asts, .. }) => {
             let depth = depth.checked_add(1).unwrap();
             for ast in asts {
                 try!(error_if_nested(ast, limit, depth));
             }
             Ok(())
         }
-        Ast::Concat(AstConcat { ref asts, .. }) => {
+        Ast::Concat(ast::Concat { ref asts, .. }) => {
             let depth = depth.checked_add(1).unwrap();
             for ast in asts {
                 try!(error_if_nested(ast, limit, depth));
@@ -1912,44 +1979,44 @@ fn error_if_nested(
 
 /// Returns an error if the given AST class exceeds the given depth limit.
 fn error_if_nested_class(
-    class: &AstClass,
+    class: &ast::Class,
     limit: u32,
     depth: u32,
 ) -> Result<()> {
     if depth >= limit {
-        return Err(AstError {
+        return Err(ast::Error {
             span: *class.span(),
-            kind: AstErrorKind::NestLimitExceeded(limit),
+            kind: ast::ErrorKind::NestLimitExceeded(limit),
         });
     }
     match *class {
-        AstClass::Perl(_)
-        | AstClass::Unicode(_) => Ok(()),
-        AstClass::Set(AstClassSet { ref op, .. }) => {
+        ast::Class::Perl(_)
+        | ast::Class::Unicode(_) => Ok(()),
+        ast::Class::Set(ast::ClassSet { ref op, .. }) => {
             error_if_nested_class_op(op, limit, depth)
         }
     }
 }
 
 fn error_if_nested_class_op(
-    op: &AstClassSetOp,
+    op: &ast::ClassSetOp,
     limit: u32,
     depth: u32,
 ) -> Result<()> {
     if depth >= limit {
-        return Err(AstError {
+        return Err(ast::Error {
             span: *op.span(),
-            kind: AstErrorKind::NestLimitExceeded(limit),
+            kind: ast::ErrorKind::NestLimitExceeded(limit),
         });
     }
     match *op {
-        AstClassSetOp::Union(AstClassSetUnion { ref items, .. }) => {
+        ast::ClassSetOp::Union(ast::ClassSetUnion { ref items, .. }) => {
             for item in items {
                 match *item {
-                    AstClassSetItem::Literal(_)
-                    | AstClassSetItem::Range(_)
-                    | AstClassSetItem::Ascii(_) => {}
-                    AstClassSetItem::Class(ref cls) => {
+                    ast::ClassSetItem::Literal(_)
+                    | ast::ClassSetItem::Range(_)
+                    | ast::ClassSetItem::Ascii(_) => {}
+                    ast::ClassSetItem::Class(ref cls) => {
                         let depth = depth.checked_add(1).unwrap();
                         try!(error_if_nested_class(cls, limit, depth));
                     }
@@ -1957,7 +2024,7 @@ fn error_if_nested_class_op(
             }
             Ok(())
         }
-        AstClassSetOp::BinaryOp(AstClassSetBinaryOp {
+        ast::ClassSetOp::BinaryOp(ast::ClassSetBinaryOp {
             ref lhs, ref rhs, ..
         }) => {
             let depth = depth.checked_add(1).unwrap();
@@ -1972,8 +2039,8 @@ fn error_if_nested_class_op(
 mod tests {
     use std::ops::Range;
 
-    use ast::*;
-    use super::{Parser, ParserBuilder, Primitive};
+    use ast::{self, Ast, Position, Span};
+    use super::{Parser, ParserI, ParserBuilder, Primitive};
 
     macro_rules! assert_eq {
         ($left:expr, $right:expr) => ({
@@ -1993,20 +2060,22 @@ mod tests {
         str.to_string()
     }
 
-    fn parser(pattern: &str) -> Parser {
-        Parser::new(pattern)
+    fn parser(pattern: &str) -> ParserI<Parser> {
+        ParserI::new(Parser::new(), pattern)
     }
 
-    fn parser_octal(pattern: &str) -> Parser {
-        ParserBuilder::new().octal(true).build(pattern)
+    fn parser_octal(pattern: &str) -> ParserI<Parser> {
+        ParserI::new(ParserBuilder::new().octal(true).build(), pattern)
     }
 
-    fn parser_nest_limit(pattern: &str, nest_limit: u32) -> Parser {
-        ParserBuilder::new().nest_limit(nest_limit).build(pattern)
+    fn parser_nest_limit(pattern: &str, nest_limit: u32) -> ParserI<Parser> {
+        let p = ParserBuilder::new().nest_limit(nest_limit).build();
+        ParserI::new(p, pattern)
     }
 
-    fn parser_ignore_space(pattern: &str) -> Parser {
-        ParserBuilder::new().ignore_space(true).build(pattern)
+    fn parser_ignore_space(pattern: &str) -> ParserI<Parser> {
+        let p = ParserBuilder::new().ignore_space(true).build();
+        ParserI::new(p, pattern)
     }
 
     /// Short alias for creating a new span.
@@ -2058,18 +2127,18 @@ mod tests {
 
     /// Create a punctuation literal starting at the given position.
     fn punct_lit(c: char, span: Span) -> Ast {
-        Ast::Literal(AstLiteral {
+        Ast::Literal(ast::Literal {
             span: span,
-            kind: AstLiteralKind::Punctuation,
+            kind: ast::LiteralKind::Punctuation,
             c: c,
         })
     }
 
     /// Create a verbatim literal with the given span.
     fn lit_with(c: char, span: Span) -> Ast {
-        Ast::Literal(AstLiteral {
+        Ast::Literal(ast::Literal {
             span: span,
-            kind: AstLiteralKind::Verbatim,
+            kind: ast::LiteralKind::Verbatim,
             c: c,
         })
     }
@@ -2081,24 +2150,24 @@ mod tests {
 
     /// Create a concatenation with the given span.
     fn concat_with(span: Span, asts: Vec<Ast>) -> Ast {
-        Ast::Concat(AstConcat { span: span, asts: asts })
+        Ast::Concat(ast::Concat { span: span, asts: asts })
     }
 
     /// Create an alternation with the given span.
     fn alt(range: Range<usize>, asts: Vec<Ast>) -> Ast {
-        Ast::Alternation(AstAlternation { span: span(range), asts: asts })
+        Ast::Alternation(ast::Alternation { span: span(range), asts: asts })
     }
 
     /// Create a capturing group with the given span.
     fn group(range: Range<usize>, ast: Ast) -> Ast {
-        Ast::Group(AstGroup {
+        Ast::Group(ast::Group {
             span: span(range),
-            kind: AstGroupKind::CaptureIndex,
+            kind: ast::GroupKind::CaptureIndex,
             ast: Box::new(ast),
         })
     }
 
-    /// Create an AstSetFlags.
+    /// Create an ast::SetFlags.
     ///
     /// The given pattern should be the full pattern string. The range given
     /// should correspond to the byte offsets where the flag set occurs.
@@ -2108,24 +2177,24 @@ mod tests {
     fn flag_set(
         pat: &str,
         range: Range<usize>,
-        flag: AstFlag,
+        flag: ast::Flag,
         negated: bool,
     ) -> Ast {
         let mut items = vec![
-            AstFlagsItem {
+            ast::FlagsItem {
                 span: span_range(pat, (range.end - 2)..(range.end - 1)),
-                kind: AstFlagsItemKind::Flag(flag),
+                kind: ast::FlagsItemKind::Flag(flag),
             },
         ];
         if negated {
-            items.insert(0, AstFlagsItem {
+            items.insert(0, ast::FlagsItem {
                 span: span_range(pat, (range.start + 2)..(range.end - 2)),
-                kind: AstFlagsItemKind::Negation,
+                kind: ast::FlagsItemKind::Negation,
             });
         }
-        Ast::Flags(AstSetFlags {
+        Ast::Flags(ast::SetFlags {
             span: span_range(pat, range.clone()),
-            flags: AstFlags {
+            flags: ast::Flags {
                 span: span_range(pat, (range.start + 2)..(range.end - 1)),
                 items: items,
             },
@@ -2136,63 +2205,63 @@ mod tests {
     fn parse_nest_limit() {
         assert_eq!(
             parser_nest_limit("", 0).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..0),
-                kind: AstErrorKind::NestLimitExceeded(0),
+                kind: ast::ErrorKind::NestLimitExceeded(0),
             }));
         assert_eq!(
             parser_nest_limit("", 1).parse(),
             Ok(Ast::Empty(span(0..0))));
         assert_eq!(
             parser_nest_limit("a", 0).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::NestLimitExceeded(0),
+                kind: ast::ErrorKind::NestLimitExceeded(0),
             }));
         assert_eq!(
             parser_nest_limit("a", 1).parse(),
             Ok(lit('a', 0)));
         assert_eq!(
             parser_nest_limit("((()))", 0).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..6),
-                kind: AstErrorKind::NestLimitExceeded(0),
+                kind: ast::ErrorKind::NestLimitExceeded(0),
             }));
         assert_eq!(
             parser_nest_limit("((()))", 1).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..5),
-                kind: AstErrorKind::NestLimitExceeded(1),
+                kind: ast::ErrorKind::NestLimitExceeded(1),
             }));
         assert_eq!(
             parser_nest_limit("((()))", 2).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(2..4),
-                kind: AstErrorKind::NestLimitExceeded(2),
+                kind: ast::ErrorKind::NestLimitExceeded(2),
             }));
         assert_eq!(
             parser_nest_limit("((()))", 3).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(3..3),
-                kind: AstErrorKind::NestLimitExceeded(3),
+                kind: ast::ErrorKind::NestLimitExceeded(3),
             }));
         assert_eq!(
             parser_nest_limit("ab+", 2).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..2),
-                kind: AstErrorKind::NestLimitExceeded(2),
+                kind: ast::ErrorKind::NestLimitExceeded(2),
             }));
         assert_eq!(
             parser_nest_limit("[ab[cd]]", 1).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(3..7),
-                kind: AstErrorKind::NestLimitExceeded(1),
+                kind: ast::ErrorKind::NestLimitExceeded(1),
             }));
         assert_eq!(
             parser_nest_limit("[ab--cd]", 1).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..3),
-                kind: AstErrorKind::NestLimitExceeded(1),
+                kind: ast::ErrorKind::NestLimitExceeded(1),
             }));
     }
 
@@ -2208,7 +2277,7 @@ bar
         assert_eq!(
             astc.ast,
             concat_with(span_range(pat, 0..pat.len()), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
                 lit_with('f', span_range(pat, 26..27)),
                 lit_with('o', span_range(pat, 27..28)),
                 lit_with('o', span_range(pat, 28..29)),
@@ -2217,19 +2286,19 @@ bar
                 lit_with('r', span_range(pat, 76..77)),
             ]));
         assert_eq!(astc.comments, vec![
-            AstComment {
+            ast::Comment {
                 span: span_range(pat, 5..26),
                 comment: s(" This is comment 1."),
             },
-            AstComment {
+            ast::Comment {
                 span: span_range(pat, 30..51),
                 comment: s(" This is comment 2."),
             },
-            AstComment {
+            ast::Comment {
                 span: span_range(pat, 53..74),
                 comment: s(" This is comment 3."),
             },
-            AstComment {
+            ast::Comment {
                 span: span_range(pat, 78..98),
                 comment: s(" This is comment 4."),
             },
@@ -2272,7 +2341,7 @@ bar
         assert_eq!(
             parser(pat).parse(),
             Ok(concat_with(nspan(npos(0, 1, 1), npos(7, 1, 8)), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
                 lit_with('a', nspan(npos(4, 1, 5), npos(5, 1, 6))),
                 lit_with('b', nspan(npos(6, 1, 7), npos(7, 1, 8))),
             ])));
@@ -2282,10 +2351,10 @@ bar
         assert_eq!(
             parser(pat).parse(),
             Ok(concat_with(nspan(npos(0, 1, 1), npos(15, 1, 16)), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
                 lit_with('a', nspan(npos(4, 1, 5), npos(5, 1, 6))),
                 lit_with('b', nspan(npos(6, 1, 7), npos(7, 1, 8))),
-                flag_set(pat, 7..12, AstFlag::IgnoreWhitespace, true),
+                flag_set(pat, 7..12, ast::Flag::IgnoreWhitespace, true),
                 lit_with('a', nspan(npos(12, 1, 13), npos(13, 1, 14))),
                 lit_with(' ', nspan(npos(13, 1, 14), npos(14, 1, 15))),
                 lit_with('b', nspan(npos(14, 1, 15), npos(15, 1, 16))),
@@ -2298,15 +2367,15 @@ bar
             Ok(concat_with(span_range(pat, 0..11), vec![
                 lit_with('a', span_range(pat, 0..1)),
                 lit_with(' ', span_range(pat, 1..2)),
-                Ast::Group(AstGroup {
+                Ast::Group(ast::Group {
                     span: span_range(pat, 2..9),
-                    kind: AstGroupKind::NonCapturing(AstFlags {
+                    kind: ast::GroupKind::NonCapturing(ast::Flags {
                         span: span_range(pat, 4..5),
                         items: vec![
-                            AstFlagsItem {
+                            ast::FlagsItem {
                                 span: span_range(pat, 4..5),
-                                kind: AstFlagsItemKind::Flag(
-                                    AstFlag::IgnoreWhitespace),
+                                kind: ast::FlagsItemKind::Flag(
+                                    ast::Flag::IgnoreWhitespace),
                             },
                         ],
                     }),
@@ -2321,10 +2390,10 @@ bar
         assert_eq!(
             parser(pat).parse(),
             Ok(concat_with(span_range(pat, 0..pat.len()), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
-                Ast::Group(AstGroup {
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
+                Ast::Group(ast::Group {
                     span: span_range(pat, 4..pat.len()),
-                    kind: AstGroupKind::CaptureName(AstCaptureName {
+                    kind: ast::GroupKind::CaptureName(ast::CaptureName {
                         span: span_range(pat, 9..12),
                         name: s("foo"),
                     }),
@@ -2335,10 +2404,10 @@ bar
         assert_eq!(
             parser(pat).parse(),
             Ok(concat_with(span_range(pat, 0..pat.len()), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
-                Ast::Group(AstGroup {
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
+                Ast::Group(ast::Group {
                     span: span_range(pat, 4..pat.len()),
-                    kind: AstGroupKind::CaptureIndex,
+                    kind: ast::GroupKind::CaptureIndex,
                     ast: Box::new(lit_with('a', span_range(pat, 7..8))),
                 }),
             ])));
@@ -2346,10 +2415,10 @@ bar
         assert_eq!(
             parser(pat).parse(),
             Ok(concat_with(span_range(pat, 0..pat.len()), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
-                Ast::Group(AstGroup {
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
+                Ast::Group(ast::Group {
                     span: span_range(pat, 4..pat.len()),
-                    kind: AstGroupKind::NonCapturing(AstFlags {
+                    kind: ast::GroupKind::NonCapturing(ast::Flags {
                         span: span_range(pat, 8..8),
                         items: vec![],
                     }),
@@ -2362,11 +2431,11 @@ bar
         assert_eq!(
             parser(pat).parse(),
             Ok(concat_with(span_range(pat, 0..pat.len()), vec![
-                flag_set(pat, 0..4, AstFlag::IgnoreWhitespace, false),
-                Ast::Literal(AstLiteral {
+                flag_set(pat, 0..4, ast::Flag::IgnoreWhitespace, false),
+                Ast::Literal(ast::Literal {
                     span: span_range(pat, 4..6),
-                    kind: AstLiteralKind::Special(
-                        AstSpecialLiteralKind::Space),
+                    kind: ast::LiteralKind::Special(
+                        ast::SpecialLiteralKind::Space),
                     c: ' ',
                 }),
             ])));
@@ -2374,9 +2443,9 @@ bar
         let pat = r"\ ";
         assert_eq!(
             parser(pat).parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span_range(pat, 0..2),
-                kind: AstErrorKind::EscapeUnrecognized { c: ' ' },
+                kind: ast::ErrorKind::EscapeUnrecognized { c: ' ' },
             }));
     }
 
@@ -2418,22 +2487,22 @@ bar
     fn parse_uncounted_repetition() {
         assert_eq!(
             parser(r"*").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..1),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..1),
-                    kind: AstRepetitionKind::ZeroOrMore,
+                    kind: ast::RepetitionKind::ZeroOrMore,
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"+").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..1),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..1),
-                    kind: AstRepetitionKind::OneOrMore,
+                    kind: ast::RepetitionKind::OneOrMore,
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
@@ -2441,33 +2510,33 @@ bar
 
         assert_eq!(
             parser(r"?").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..1),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..1),
-                    kind: AstRepetitionKind::ZeroOrOne,
+                    kind: ast::RepetitionKind::ZeroOrOne,
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"??").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..2),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..2),
-                    kind: AstRepetitionKind::ZeroOrOne,
+                    kind: ast::RepetitionKind::ZeroOrOne,
                 },
                 greedy: false,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"a?").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..2),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(1..2),
-                    kind: AstRepetitionKind::ZeroOrOne,
+                    kind: ast::RepetitionKind::ZeroOrOne,
                 },
                 greedy: true,
                 ast: Box::new(lit('a', 0)),
@@ -2475,11 +2544,11 @@ bar
         assert_eq!(
             parser(r"a?b").parse(),
             Ok(concat(0..3, vec![
-                Ast::Repetition(AstRepetition {
+                Ast::Repetition(ast::Repetition {
                     span: span(0..2),
-                    op: AstRepetitionOp {
+                    op: ast::RepetitionOp {
                         span: span(1..2),
-                        kind: AstRepetitionKind::ZeroOrOne,
+                        kind: ast::RepetitionKind::ZeroOrOne,
                     },
                     greedy: true,
                     ast: Box::new(lit('a', 0)),
@@ -2489,11 +2558,11 @@ bar
         assert_eq!(
             parser(r"a??b").parse(),
             Ok(concat(0..4, vec![
-                Ast::Repetition(AstRepetition {
+                Ast::Repetition(ast::Repetition {
                     span: span(0..3),
-                    op: AstRepetitionOp {
+                    op: ast::RepetitionOp {
                         span: span(1..3),
-                        kind: AstRepetitionKind::ZeroOrOne,
+                        kind: ast::RepetitionKind::ZeroOrOne,
                     },
                     greedy: false,
                     ast: Box::new(lit('a', 0)),
@@ -2504,11 +2573,11 @@ bar
             parser(r"ab?").parse(),
             Ok(concat(0..3, vec![
                 lit('a', 0),
-                Ast::Repetition(AstRepetition {
+                Ast::Repetition(ast::Repetition {
                     span: span(1..3),
-                    op: AstRepetitionOp {
+                    op: ast::RepetitionOp {
                         span: span(2..3),
-                        kind: AstRepetitionKind::ZeroOrOne,
+                        kind: ast::RepetitionKind::ZeroOrOne,
                     },
                     greedy: true,
                     ast: Box::new(lit('b', 1)),
@@ -2516,11 +2585,11 @@ bar
             ])));
         assert_eq!(
             parser(r"(ab)?").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..5),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(4..5),
-                    kind: AstRepetitionKind::ZeroOrOne,
+                    kind: ast::RepetitionKind::ZeroOrOne,
                 },
                 greedy: true,
                 ast: Box::new(group(0..4, concat(1..3, vec![
@@ -2532,11 +2601,11 @@ bar
             parser(r"|?").parse(),
             Ok(alt(0..2, vec![
                 Ast::Empty(span(0..0)),
-                Ast::Repetition(AstRepetition {
+                Ast::Repetition(ast::Repetition {
                     span: span(1..2),
-                    op: AstRepetitionOp {
+                    op: ast::RepetitionOp {
                         span: span(1..2),
-                        kind: AstRepetitionKind::ZeroOrOne,
+                        kind: ast::RepetitionKind::ZeroOrOne,
                     },
                     greedy: true,
                     ast: Box::new(Ast::Empty(span(1..1))),
@@ -2548,60 +2617,60 @@ bar
     fn parse_counted_repetition() {
         assert_eq!(
             parser(r"{5}").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..3),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..3),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Exactly(5)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Exactly(5)),
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"{5,}").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..4),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..4),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::AtLeast(5)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::AtLeast(5)),
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"{5,9}").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..5),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..5),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Bounded(5, 9)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Bounded(5, 9)),
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"{5}?").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..4),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..4),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Exactly(5)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Exactly(5)),
                 },
                 greedy: false,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"a{5}").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..4),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(1..4),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Exactly(5)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Exactly(5)),
                 },
                 greedy: true,
                 ast: Box::new(lit('a', 0)),
@@ -2610,12 +2679,12 @@ bar
             parser(r"ab{5}").parse(),
             Ok(concat(0..5, vec![
                 lit('a', 0),
-                Ast::Repetition(AstRepetition {
+                Ast::Repetition(ast::Repetition {
                     span: span(1..5),
-                    op: AstRepetitionOp {
+                    op: ast::RepetitionOp {
                         span: span(2..5),
-                        kind: AstRepetitionKind::Range(
-                            AstRepetitionRange::Exactly(5)),
+                        kind: ast::RepetitionKind::Range(
+                            ast::RepetitionRange::Exactly(5)),
                     },
                     greedy: true,
                     ast: Box::new(lit('b', 1)),
@@ -2625,12 +2694,12 @@ bar
             parser(r"ab{5}c").parse(),
             Ok(concat(0..6, vec![
                 lit('a', 0),
-                Ast::Repetition(AstRepetition {
+                Ast::Repetition(ast::Repetition {
                     span: span(1..5),
-                    op: AstRepetitionOp {
+                    op: ast::RepetitionOp {
                         span: span(2..5),
-                        kind: AstRepetitionKind::Range(
-                            AstRepetitionRange::Exactly(5)),
+                        kind: ast::RepetitionKind::Range(
+                            ast::RepetitionRange::Exactly(5)),
                     },
                     greedy: true,
                     ast: Box::new(lit('b', 1)),
@@ -2640,36 +2709,36 @@ bar
 
         assert_eq!(
             parser(r"{ 5 }").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..5),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..5),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Exactly(5)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Exactly(5)),
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser(r"{ 5 , 9 }").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..9),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..9),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Bounded(5, 9)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Bounded(5, 9)),
                 },
                 greedy: true,
                 ast: Box::new(Ast::Empty(span(0..0))),
             })));
         assert_eq!(
             parser_ignore_space(r"{5,9} ?").parse(),
-            Ok(Ast::Repetition(AstRepetition {
+            Ok(Ast::Repetition(ast::Repetition {
                 span: span(0..7),
-                op: AstRepetitionOp {
+                op: ast::RepetitionOp {
                     span: span(0..7),
-                    kind: AstRepetitionKind::Range(
-                        AstRepetitionRange::Bounded(5, 9)),
+                    kind: ast::RepetitionKind::Range(
+                        ast::RepetitionRange::Bounded(5, 9)),
                 },
                 greedy: false,
                 ast: Box::new(Ast::Empty(span(0..0))),
@@ -2677,57 +2746,57 @@ bar
 
         assert_eq!(
             parser(r"{").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             }));
         assert_eq!(
             parser(r"{}").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..1),
-                kind: AstErrorKind::DecimalEmpty,
+                kind: ast::ErrorKind::DecimalEmpty,
             }));
         assert_eq!(
             parser(r"{a").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..1),
-                kind: AstErrorKind::DecimalEmpty,
+                kind: ast::ErrorKind::DecimalEmpty,
             }));
         assert_eq!(
             parser(r"{9999999999}").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..11),
-                kind: AstErrorKind::DecimalInvalid,
+                kind: ast::ErrorKind::DecimalInvalid,
             }));
         assert_eq!(
             parser(r"{9").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..2),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             }));
         assert_eq!(
             parser(r"{9,a").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(3..3),
-                kind: AstErrorKind::DecimalEmpty,
+                kind: ast::ErrorKind::DecimalEmpty,
             }));
         assert_eq!(
             parser(r"{9,9999999999}").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(3..13),
-                kind: AstErrorKind::DecimalInvalid,
+                kind: ast::ErrorKind::DecimalInvalid,
             }));
         assert_eq!(
             parser(r"{9,").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..3),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             }));
         assert_eq!(
             parser(r"{9,11").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..5),
-                kind: AstErrorKind::CountedRepetitionUnclosed,
+                kind: ast::ErrorKind::CountedRepetitionUnclosed,
             }));
     }
 
@@ -2735,26 +2804,26 @@ bar
     fn parse_alternate() {
         assert_eq!(
             parser(r"a|b").parse(),
-            Ok(Ast::Alternation(AstAlternation {
+            Ok(Ast::Alternation(ast::Alternation {
                 span: span(0..3),
                 asts: vec![lit('a', 0), lit('b', 2)],
             })));
         assert_eq!(
             parser(r"(a|b)").parse(),
-            Ok(group(0..5, Ast::Alternation(AstAlternation {
+            Ok(group(0..5, Ast::Alternation(ast::Alternation {
                 span: span(1..4),
                 asts: vec![lit('a', 1), lit('b', 3)],
             }))));
 
         assert_eq!(
             parser(r"a|b|c").parse(),
-            Ok(Ast::Alternation(AstAlternation {
+            Ok(Ast::Alternation(ast::Alternation {
                 span: span(0..5),
                 asts: vec![lit('a', 0), lit('b', 2), lit('c', 4)],
             })));
         assert_eq!(
             parser(r"ax|by|cz").parse(),
-            Ok(Ast::Alternation(AstAlternation {
+            Ok(Ast::Alternation(ast::Alternation {
                 span: span(0..8),
                 asts: vec![
                     concat(0..2, vec![lit('a', 0), lit('x', 1)]),
@@ -2764,7 +2833,7 @@ bar
             })));
         assert_eq!(
             parser(r"(ax|by|cz)").parse(),
-            Ok(group(0..10, Ast::Alternation(AstAlternation {
+            Ok(group(0..10, Ast::Alternation(ast::Alternation {
                 span: span(1..9),
                 asts: vec![
                     concat(1..3, vec![lit('a', 1), lit('x', 2)]),
@@ -2818,317 +2887,317 @@ bar
             ]))));
 
         assert_eq!(
-            parser(r"a|b)").parse(), Err(AstError {
+            parser(r"a|b)").parse(), Err(ast::Error {
                 span: span(3..4),
-                kind: AstErrorKind::GroupUnopened,
+                kind: ast::ErrorKind::GroupUnopened,
             }));
         assert_eq!(
-            parser(r"(a|b").parse(), Err(AstError {
+            parser(r"(a|b").parse(), Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::GroupUnclosed,
+                kind: ast::ErrorKind::GroupUnclosed,
             }));
     }
 
     #[test]
     fn parse_unsupported_lookaround() {
-        assert_eq!(parser(r"(?=a)").parse(), Err(AstError {
+        assert_eq!(parser(r"(?=a)").parse(), Err(ast::Error {
             span: span(0..3),
-            kind: AstErrorKind::UnsupportedLookAround,
+            kind: ast::ErrorKind::UnsupportedLookAround,
         }));
-        assert_eq!(parser(r"(?!a)").parse(), Err(AstError {
+        assert_eq!(parser(r"(?!a)").parse(), Err(ast::Error {
             span: span(0..3),
-            kind: AstErrorKind::UnsupportedLookAround,
+            kind: ast::ErrorKind::UnsupportedLookAround,
         }));
-        assert_eq!(parser(r"(?<=a)").parse(), Err(AstError {
+        assert_eq!(parser(r"(?<=a)").parse(), Err(ast::Error {
             span: span(0..4),
-            kind: AstErrorKind::UnsupportedLookAround,
+            kind: ast::ErrorKind::UnsupportedLookAround,
         }));
-        assert_eq!(parser(r"(?<!a)").parse(), Err(AstError {
+        assert_eq!(parser(r"(?<!a)").parse(), Err(ast::Error {
             span: span(0..4),
-            kind: AstErrorKind::UnsupportedLookAround,
+            kind: ast::ErrorKind::UnsupportedLookAround,
         }));
     }
 
     #[test]
     fn parse_group() {
-        assert_eq!(parser("(?i)").parse(), Ok(Ast::Flags(AstSetFlags {
+        assert_eq!(parser("(?i)").parse(), Ok(Ast::Flags(ast::SetFlags {
             span: span(0..4),
-            flags: AstFlags {
+            flags: ast::Flags {
                 span: span(2..3),
-                items: vec![AstFlagsItem {
+                items: vec![ast::FlagsItem {
                     span: span(2..3),
-                    kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                 }],
             },
         })));
-        assert_eq!(parser("(?iU)").parse(), Ok(Ast::Flags(AstSetFlags {
+        assert_eq!(parser("(?iU)").parse(), Ok(Ast::Flags(ast::SetFlags {
             span: span(0..5),
-            flags: AstFlags {
+            flags: ast::Flags {
                 span: span(2..4),
                 items: vec![
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(2..3),
-                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                     },
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(3..4),
-                        kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::SwapGreed),
                     },
                 ],
             },
         })));
-        assert_eq!(parser("(?i-U)").parse(), Ok(Ast::Flags(AstSetFlags {
+        assert_eq!(parser("(?i-U)").parse(), Ok(Ast::Flags(ast::SetFlags {
             span: span(0..6),
-            flags: AstFlags {
+            flags: ast::Flags {
                 span: span(2..5),
                 items: vec![
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(2..3),
-                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                     },
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(3..4),
-                        kind: AstFlagsItemKind::Negation,
+                        kind: ast::FlagsItemKind::Negation,
                     },
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(4..5),
-                        kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::SwapGreed),
                     },
                 ],
             },
         })));
 
-        assert_eq!(parser("()").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("()").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..2),
-            kind: AstGroupKind::CaptureIndex,
+            kind: ast::GroupKind::CaptureIndex,
             ast: Box::new(Ast::Empty(span(1..1))),
         })));
-        assert_eq!(parser("(a)").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(a)").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..3),
-            kind: AstGroupKind::CaptureIndex,
+            kind: ast::GroupKind::CaptureIndex,
             ast: Box::new(lit('a', 1)),
         })));
-        assert_eq!(parser("(())").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(())").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..4),
-            kind: AstGroupKind::CaptureIndex,
-            ast: Box::new(Ast::Group(AstGroup {
+            kind: ast::GroupKind::CaptureIndex,
+            ast: Box::new(Ast::Group(ast::Group {
                 span: span(1..3),
-                kind: AstGroupKind::CaptureIndex,
+                kind: ast::GroupKind::CaptureIndex,
                 ast: Box::new(Ast::Empty(span(2..2))),
             })),
         })));
 
-        assert_eq!(parser("(?:a)").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(?:a)").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..5),
-            kind: AstGroupKind::NonCapturing(AstFlags {
+            kind: ast::GroupKind::NonCapturing(ast::Flags {
                 span: span(2..2),
                 items: vec![],
             }),
             ast: Box::new(lit('a', 3)),
         })));
 
-        assert_eq!(parser("(?i:a)").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(?i:a)").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..6),
-            kind: AstGroupKind::NonCapturing(AstFlags {
+            kind: ast::GroupKind::NonCapturing(ast::Flags {
                 span: span(2..3),
                 items: vec![
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(2..3),
-                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                     },
                 ],
             }),
             ast: Box::new(lit('a', 4)),
         })));
-        assert_eq!(parser("(?i-U:a)").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(?i-U:a)").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..8),
-            kind: AstGroupKind::NonCapturing(AstFlags {
+            kind: ast::GroupKind::NonCapturing(ast::Flags {
                 span: span(2..5),
                 items: vec![
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(2..3),
-                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                     },
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(3..4),
-                        kind: AstFlagsItemKind::Negation,
+                        kind: ast::FlagsItemKind::Negation,
                     },
-                    AstFlagsItem {
+                    ast::FlagsItem {
                         span: span(4..5),
-                        kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                        kind: ast::FlagsItemKind::Flag(ast::Flag::SwapGreed),
                     },
                 ],
             }),
             ast: Box::new(lit('a', 6)),
         })));
 
-        assert_eq!(parser("(").parse(), Err(AstError {
+        assert_eq!(parser("(").parse(), Err(ast::Error {
             span: span(0..1),
-            kind: AstErrorKind::GroupUnclosed,
+            kind: ast::ErrorKind::GroupUnclosed,
         }));
-        assert_eq!(parser("(a").parse(), Err(AstError {
+        assert_eq!(parser("(a").parse(), Err(ast::Error {
             span: span(0..1),
-            kind: AstErrorKind::GroupUnclosed,
+            kind: ast::ErrorKind::GroupUnclosed,
         }));
-        assert_eq!(parser("(()").parse(), Err(AstError {
+        assert_eq!(parser("(()").parse(), Err(ast::Error {
             span: span(0..1),
-            kind: AstErrorKind::GroupUnclosed,
+            kind: ast::ErrorKind::GroupUnclosed,
         }));
-        assert_eq!(parser(")").parse(), Err(AstError {
+        assert_eq!(parser(")").parse(), Err(ast::Error {
             span: span(0..1),
-            kind: AstErrorKind::GroupUnopened,
+            kind: ast::ErrorKind::GroupUnopened,
         }));
-        assert_eq!(parser("a)").parse(), Err(AstError {
+        assert_eq!(parser("a)").parse(), Err(ast::Error {
             span: span(1..2),
-            kind: AstErrorKind::GroupUnopened,
+            kind: ast::ErrorKind::GroupUnopened,
         }));
     }
 
     #[test]
     fn parse_capture_name() {
-        assert_eq!(parser("(?P<a>z)").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(?P<a>z)").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..8),
-            kind: AstGroupKind::CaptureName(AstCaptureName {
+            kind: ast::GroupKind::CaptureName(ast::CaptureName {
                 span: span(4..5),
                 name: s("a"),
             }),
             ast: Box::new(lit('z', 6)),
         })));
-        assert_eq!(parser("(?P<abc>z)").parse(), Ok(Ast::Group(AstGroup {
+        assert_eq!(parser("(?P<abc>z)").parse(), Ok(Ast::Group(ast::Group {
             span: span(0..10),
-            kind: AstGroupKind::CaptureName(AstCaptureName {
+            kind: ast::GroupKind::CaptureName(ast::CaptureName {
                 span: span(4..7),
                 name: s("abc"),
             }),
             ast: Box::new(lit('z', 8)),
         })));
 
-        assert_eq!(parser("(?P<").parse(), Err(AstError {
+        assert_eq!(parser("(?P<").parse(), Err(ast::Error {
             span: span(4..4),
-            kind: AstErrorKind::GroupNameUnexpectedEof,
+            kind: ast::ErrorKind::GroupNameUnexpectedEof,
         }));
-        assert_eq!(parser("(?P<>z)").parse(), Err(AstError {
+        assert_eq!(parser("(?P<>z)").parse(), Err(ast::Error {
             span: span(4..4),
-            kind: AstErrorKind::GroupNameEmpty,
+            kind: ast::ErrorKind::GroupNameEmpty,
         }));
-        assert_eq!(parser("(?P<a").parse(), Err(AstError {
+        assert_eq!(parser("(?P<a").parse(), Err(ast::Error {
             span: span(5..5),
-            kind: AstErrorKind::GroupNameUnexpectedEof,
+            kind: ast::ErrorKind::GroupNameUnexpectedEof,
         }));
-        assert_eq!(parser("(?P<ab").parse(), Err(AstError {
+        assert_eq!(parser("(?P<ab").parse(), Err(ast::Error {
             span: span(6..6),
-            kind: AstErrorKind::GroupNameUnexpectedEof,
+            kind: ast::ErrorKind::GroupNameUnexpectedEof,
         }));
-        assert_eq!(parser("(?P<0a").parse(), Err(AstError {
+        assert_eq!(parser("(?P<0a").parse(), Err(ast::Error {
             span: span(4..5),
-            kind: AstErrorKind::GroupNameInvalid { c: '0' },
+            kind: ast::ErrorKind::GroupNameInvalid { c: '0' },
         }));
-        assert_eq!(parser("(?P<~").parse(), Err(AstError {
+        assert_eq!(parser("(?P<~").parse(), Err(ast::Error {
             span: span(4..5),
-            kind: AstErrorKind::GroupNameInvalid { c: '~' },
+            kind: ast::ErrorKind::GroupNameInvalid { c: '~' },
         }));
-        assert_eq!(parser("(?P<abc~").parse(), Err(AstError {
+        assert_eq!(parser("(?P<abc~").parse(), Err(ast::Error {
             span: span(7..8),
-            kind: AstErrorKind::GroupNameInvalid { c: '~' },
+            kind: ast::ErrorKind::GroupNameInvalid { c: '~' },
         }));
     }
 
     #[test]
     fn parse_flags() {
-        assert_eq!(parser("i:").parse_flags(), Ok(AstFlags {
+        assert_eq!(parser("i:").parse_flags(), Ok(ast::Flags {
             span: span(0..1),
-            items: vec![AstFlagsItem {
+            items: vec![ast::FlagsItem {
                 span: span(0..1),
-                kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
             }],
         }));
-        assert_eq!(parser("i)").parse_flags(), Ok(AstFlags {
+        assert_eq!(parser("i)").parse_flags(), Ok(ast::Flags {
             span: span(0..1),
-            items: vec![AstFlagsItem {
+            items: vec![ast::FlagsItem {
                 span: span(0..1),
-                kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
             }],
         }));
 
-        assert_eq!(parser("isU:").parse_flags(), Ok(AstFlags {
+        assert_eq!(parser("isU:").parse_flags(), Ok(ast::Flags {
             span: span(0..3),
             items: vec![
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(0..1),
-                    kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(1..2),
-                    kind: AstFlagsItemKind::Flag(AstFlag::DotMatchesNewLine),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::DotMatchesNewLine),
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(2..3),
-                    kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::SwapGreed),
                 },
             ],
         }));
 
-        assert_eq!(parser("-isU:").parse_flags(), Ok(AstFlags {
+        assert_eq!(parser("-isU:").parse_flags(), Ok(ast::Flags {
             span: span(0..4),
             items: vec![
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(0..1),
-                    kind: AstFlagsItemKind::Negation,
+                    kind: ast::FlagsItemKind::Negation,
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(1..2),
-                    kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(2..3),
-                    kind: AstFlagsItemKind::Flag(AstFlag::DotMatchesNewLine),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::DotMatchesNewLine),
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(3..4),
-                    kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::SwapGreed),
                 },
             ],
         }));
-        assert_eq!(parser("i-sU:").parse_flags(), Ok(AstFlags {
+        assert_eq!(parser("i-sU:").parse_flags(), Ok(ast::Flags {
             span: span(0..4),
             items: vec![
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(0..1),
-                    kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive),
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(1..2),
-                    kind: AstFlagsItemKind::Negation,
+                    kind: ast::FlagsItemKind::Negation,
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(2..3),
-                    kind: AstFlagsItemKind::Flag(AstFlag::DotMatchesNewLine),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::DotMatchesNewLine),
                 },
-                AstFlagsItem {
+                ast::FlagsItem {
                     span: span(3..4),
-                    kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                    kind: ast::FlagsItemKind::Flag(ast::Flag::SwapGreed),
                 },
             ],
         }));
 
-        assert_eq!(parser("isU").parse_flags(), Err(AstError {
+        assert_eq!(parser("isU").parse_flags(), Err(ast::Error {
             span: span(3..3),
-            kind: AstErrorKind::FlagUnexpectedEof,
+            kind: ast::ErrorKind::FlagUnexpectedEof,
         }));
-        assert_eq!(parser("isUa:").parse_flags(), Err(AstError {
+        assert_eq!(parser("isUa:").parse_flags(), Err(ast::Error {
             span: span(3..4),
-            kind: AstErrorKind::FlagUnrecognized { flag: 'a' },
+            kind: ast::ErrorKind::FlagUnrecognized { flag: 'a' },
         }));
-        assert_eq!(parser("isUi:").parse_flags(), Err(AstError {
+        assert_eq!(parser("isUi:").parse_flags(), Err(ast::Error {
             span: span(3..4),
-            kind: AstErrorKind::FlagDuplicate {
+            kind: ast::ErrorKind::FlagDuplicate {
                 flag: 'i',
                 original: span(0..1),
             },
         }));
-        assert_eq!(parser("i-sU-i:").parse_flags(), Err(AstError {
+        assert_eq!(parser("i-sU-i:").parse_flags(), Err(ast::Error {
             span: span(4..5),
-            kind: AstErrorKind::FlagRepeatedNegation {
+            kind: ast::ErrorKind::FlagRepeatedNegation {
                 original: span(1..2),
             },
         }));
@@ -3136,20 +3205,20 @@ bar
 
     #[test]
     fn parse_flag() {
-        assert_eq!(parser("i").parse_flag(), Ok(AstFlag::CaseInsensitive));
-        assert_eq!(parser("m").parse_flag(), Ok(AstFlag::MultiLine));
-        assert_eq!(parser("s").parse_flag(), Ok(AstFlag::DotMatchesNewLine));
-        assert_eq!(parser("U").parse_flag(), Ok(AstFlag::SwapGreed));
-        assert_eq!(parser("u").parse_flag(), Ok(AstFlag::Unicode));
-        assert_eq!(parser("x").parse_flag(), Ok(AstFlag::IgnoreWhitespace));
+        assert_eq!(parser("i").parse_flag(), Ok(ast::Flag::CaseInsensitive));
+        assert_eq!(parser("m").parse_flag(), Ok(ast::Flag::MultiLine));
+        assert_eq!(parser("s").parse_flag(), Ok(ast::Flag::DotMatchesNewLine));
+        assert_eq!(parser("U").parse_flag(), Ok(ast::Flag::SwapGreed));
+        assert_eq!(parser("u").parse_flag(), Ok(ast::Flag::Unicode));
+        assert_eq!(parser("x").parse_flag(), Ok(ast::Flag::IgnoreWhitespace));
 
-        assert_eq!(parser("a").parse_flag(), Err(AstError {
+        assert_eq!(parser("a").parse_flag(), Err(ast::Error {
             span: span(0..1),
-            kind: AstErrorKind::FlagUnrecognized { flag: 'a' },
+            kind: ast::ErrorKind::FlagUnrecognized { flag: 'a' },
         }));
-        assert_eq!(parser("☃").parse_flag(), Err(AstError {
+        assert_eq!(parser("☃").parse_flag(), Err(ast::Error {
             span: span_range("☃", 0..3),
-            kind: AstErrorKind::FlagUnrecognized { flag: '☃' },
+            kind: ast::ErrorKind::FlagUnrecognized { flag: '☃' },
         }));
     }
 
@@ -3160,36 +3229,36 @@ bar
             Ok(Primitive::Dot(span(0..1))));
         assert_eq!(
             parser(r"^").parse_primitive(),
-            Ok(Primitive::Assertion(AstAssertion {
+            Ok(Primitive::Assertion(ast::Assertion {
                 span: span(0..1),
-                kind: AstAssertionKind::StartLine,
+                kind: ast::AssertionKind::StartLine,
             })));
         assert_eq!(
             parser(r"$").parse_primitive(),
-            Ok(Primitive::Assertion(AstAssertion {
+            Ok(Primitive::Assertion(ast::Assertion {
                 span: span(0..1),
-                kind: AstAssertionKind::EndLine,
+                kind: ast::AssertionKind::EndLine,
             })));
 
         assert_eq!(
             parser(r"a").parse_primitive(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..1),
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: 'a',
             })));
         assert_eq!(
             parser(r"|").parse_primitive(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..1),
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: '|',
             })));
         assert_eq!(
             parser(r"☃").parse_primitive(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span_range("☃", 0..3),
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: '☃',
             })));
     }
@@ -3198,72 +3267,72 @@ bar
     fn parse_escape() {
         assert_eq!(
             parser(r"\|").parse_primitive(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..2),
-                kind: AstLiteralKind::Punctuation,
+                kind: ast::LiteralKind::Punctuation,
                 c: '|',
             })));
         let specials = &[
-            (r"\a", '\x07', AstSpecialLiteralKind::Bell),
-            (r"\f", '\x0C', AstSpecialLiteralKind::FormFeed),
-            (r"\t", '\t', AstSpecialLiteralKind::Tab),
-            (r"\n", '\n', AstSpecialLiteralKind::LineFeed),
-            (r"\r", '\r', AstSpecialLiteralKind::CarriageReturn),
-            (r"\v", '\x0B', AstSpecialLiteralKind::VerticalTab),
+            (r"\a", '\x07', ast::SpecialLiteralKind::Bell),
+            (r"\f", '\x0C', ast::SpecialLiteralKind::FormFeed),
+            (r"\t", '\t', ast::SpecialLiteralKind::Tab),
+            (r"\n", '\n', ast::SpecialLiteralKind::LineFeed),
+            (r"\r", '\r', ast::SpecialLiteralKind::CarriageReturn),
+            (r"\v", '\x0B', ast::SpecialLiteralKind::VerticalTab),
         ];
         for &(pat, c, ref kind) in specials {
             assert_eq!(
                 parser(pat).parse_primitive(),
-                Ok(Primitive::Literal(AstLiteral {
+                Ok(Primitive::Literal(ast::Literal {
                     span: span(0..2),
-                    kind: AstLiteralKind::Special(kind.clone()),
+                    kind: ast::LiteralKind::Special(kind.clone()),
                     c: c,
                 })));
         }
         assert_eq!(
             parser(r"\A").parse_primitive(),
-            Ok(Primitive::Assertion(AstAssertion {
+            Ok(Primitive::Assertion(ast::Assertion {
                 span: span(0..2),
-                kind: AstAssertionKind::StartText,
+                kind: ast::AssertionKind::StartText,
             })));
         assert_eq!(
             parser(r"\z").parse_primitive(),
-            Ok(Primitive::Assertion(AstAssertion {
+            Ok(Primitive::Assertion(ast::Assertion {
                 span: span(0..2),
-                kind: AstAssertionKind::EndText,
+                kind: ast::AssertionKind::EndText,
             })));
         assert_eq!(
             parser(r"\b").parse_primitive(),
-            Ok(Primitive::Assertion(AstAssertion {
+            Ok(Primitive::Assertion(ast::Assertion {
                 span: span(0..2),
-                kind: AstAssertionKind::WordBoundary,
+                kind: ast::AssertionKind::WordBoundary,
             })));
         assert_eq!(
             parser(r"\B").parse_primitive(),
-            Ok(Primitive::Assertion(AstAssertion {
+            Ok(Primitive::Assertion(ast::Assertion {
                 span: span(0..2),
-                kind: AstAssertionKind::NotWordBoundary,
+                kind: ast::AssertionKind::NotWordBoundary,
             })));
 
-        assert_eq!(parser(r"\").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\").parse_escape(), Err(ast::Error {
             span: span(0..1),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\y").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\y").parse_escape(), Err(ast::Error {
             span: span(0..2),
-            kind: AstErrorKind::EscapeUnrecognized { c: 'y' },
+            kind: ast::ErrorKind::EscapeUnrecognized { c: 'y' },
         }));
     }
 
     #[test]
     fn parse_unsupported_backreference() {
-        assert_eq!(parser(r"\0").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\0").parse_escape(), Err(ast::Error {
             span: span(0..2),
-            kind: AstErrorKind::UnsupportedBackreference,
+            kind: ast::ErrorKind::UnsupportedBackreference,
         }));
-        assert_eq!(parser(r"\9").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\9").parse_escape(), Err(ast::Error {
             span: span(0..2),
-            kind: AstErrorKind::UnsupportedBackreference,
+            kind: ast::ErrorKind::UnsupportedBackreference,
         }));
     }
 
@@ -3273,64 +3342,64 @@ bar
             let pat = format!(r"\{:o}", i);
             assert_eq!(
                 parser_octal(&pat).parse_escape(),
-                Ok(Primitive::Literal(AstLiteral {
+                Ok(Primitive::Literal(ast::Literal {
                     span: span(0..pat.len()),
-                    kind: AstLiteralKind::Octal,
+                    kind: ast::LiteralKind::Octal,
                     c: ::std::char::from_u32(i).unwrap(),
                 })));
         }
         assert_eq!(
             parser_octal(r"\778").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..3),
-                kind: AstLiteralKind::Octal,
+                kind: ast::LiteralKind::Octal,
                 c: '?',
             })));
         assert_eq!(
             parser_octal(r"\7777").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..4),
-                kind: AstLiteralKind::Octal,
+                kind: ast::LiteralKind::Octal,
                 c: '\u{01FF}',
             })));
         assert_eq!(
             parser_octal(r"\778").parse(),
-            Ok(Ast::Concat(AstConcat {
+            Ok(Ast::Concat(ast::Concat {
                 span: span(0..4),
                 asts: vec![
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(0..3),
-                        kind: AstLiteralKind::Octal,
+                        kind: ast::LiteralKind::Octal,
                         c: '?',
                     }),
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(3..4),
-                        kind: AstLiteralKind::Verbatim,
+                        kind: ast::LiteralKind::Verbatim,
                         c: '8',
                     }),
                 ],
             })));
         assert_eq!(
             parser_octal(r"\7777").parse(),
-            Ok(Ast::Concat(AstConcat {
+            Ok(Ast::Concat(ast::Concat {
                 span: span(0..5),
                 asts: vec![
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(0..4),
-                        kind: AstLiteralKind::Octal,
+                        kind: ast::LiteralKind::Octal,
                         c: '\u{01FF}',
                     }),
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(4..5),
-                        kind: AstLiteralKind::Verbatim,
+                        kind: ast::LiteralKind::Verbatim,
                         c: '7',
                     }),
                 ],
             })));
 
-        assert_eq!(parser_octal(r"\8").parse_escape(), Err(AstError {
+        assert_eq!(parser_octal(r"\8").parse_escape(), Err(ast::Error {
             span: span(0..2),
-            kind: AstErrorKind::EscapeUnrecognized { c: '8' },
+            kind: ast::ErrorKind::EscapeUnrecognized { c: '8' },
         }));
     }
 
@@ -3340,24 +3409,24 @@ bar
             let pat = format!(r"\x{:02x}", i);
             assert_eq!(
                 parser(&pat).parse_escape(),
-                Ok(Primitive::Literal(AstLiteral {
+                Ok(Primitive::Literal(ast::Literal {
                     span: span(0..pat.len()),
-                    kind: AstLiteralKind::HexFixed(AstHexLiteralKind::X),
+                    kind: ast::LiteralKind::HexFixed(ast::HexLiteralKind::X),
                     c: ::std::char::from_u32(i).unwrap(),
                 })));
         }
 
-        assert_eq!(parser(r"\xF").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\xF").parse_escape(), Err(ast::Error {
             span: span(3..3),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\xG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\xG").parse_escape(), Err(ast::Error {
             span: span(2..3),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\xFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\xFG").parse_escape(), Err(ast::Error {
             span: span(3..4),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
     }
 
@@ -3371,38 +3440,38 @@ bar
             let pat = format!(r"\u{:04x}", i);
             assert_eq!(
                 parser(&pat).parse_escape(),
-                Ok(Primitive::Literal(AstLiteral {
+                Ok(Primitive::Literal(ast::Literal {
                     span: span(0..pat.len()),
-                    kind: AstLiteralKind::HexFixed(
-                        AstHexLiteralKind::UnicodeShort),
+                    kind: ast::LiteralKind::HexFixed(
+                        ast::HexLiteralKind::UnicodeShort),
                     c: c,
                 })));
         }
 
-        assert_eq!(parser(r"\uF").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\uF").parse_escape(), Err(ast::Error {
             span: span(3..3),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\uG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\uG").parse_escape(), Err(ast::Error {
             span: span(2..3),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\uFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\uFG").parse_escape(), Err(ast::Error {
             span: span(3..4),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\uFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\uFFG").parse_escape(), Err(ast::Error {
             span: span(4..5),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\uFFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\uFFFG").parse_escape(), Err(ast::Error {
             span: span(5..6),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
 
-        assert_eq!(parser(r"\uD800").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\uD800").parse_escape(), Err(ast::Error {
             span: span(2..6),
-            kind: AstErrorKind::EscapeHexInvalid,
+            kind: ast::ErrorKind::EscapeHexInvalid,
         }));
     }
 
@@ -3416,49 +3485,49 @@ bar
             let pat = format!(r"\U{:08x}", i);
             assert_eq!(
                 parser(&pat).parse_escape(),
-                Ok(Primitive::Literal(AstLiteral {
+                Ok(Primitive::Literal(ast::Literal {
                     span: span(0..pat.len()),
-                    kind: AstLiteralKind::HexFixed(
-                        AstHexLiteralKind::UnicodeLong),
+                    kind: ast::LiteralKind::HexFixed(
+                        ast::HexLiteralKind::UnicodeLong),
                     c: c,
                 })));
         }
 
-        assert_eq!(parser(r"\UF").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UF").parse_escape(), Err(ast::Error {
             span: span(3..3),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\UG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UG").parse_escape(), Err(ast::Error {
             span: span(2..3),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFG").parse_escape(), Err(ast::Error {
             span: span(3..4),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFFG").parse_escape(), Err(ast::Error {
             span: span(4..5),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFFFG").parse_escape(), Err(ast::Error {
             span: span(5..6),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFFFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFFFFG").parse_escape(), Err(ast::Error {
             span: span(6..7),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFFFFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFFFFFG").parse_escape(), Err(ast::Error {
             span: span(7..8),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFFFFFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFFFFFFG").parse_escape(), Err(ast::Error {
             span: span(8..9),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\UFFFFFFFG").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\UFFFFFFFG").parse_escape(), Err(ast::Error {
             span: span(9..10),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
     }
 
@@ -3466,73 +3535,73 @@ bar
     fn parse_hex_brace() {
         assert_eq!(
             parser(r"\u{26c4}").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..8),
-                kind: AstLiteralKind::HexBrace(
-                    AstHexLiteralKind::UnicodeShort),
+                kind: ast::LiteralKind::HexBrace(
+                    ast::HexLiteralKind::UnicodeShort),
                 c: '⛄',
             })));
         assert_eq!(
             parser(r"\U{26c4}").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..8),
-                kind: AstLiteralKind::HexBrace(
-                    AstHexLiteralKind::UnicodeLong),
+                kind: ast::LiteralKind::HexBrace(
+                    ast::HexLiteralKind::UnicodeLong),
                 c: '⛄',
             })));
         assert_eq!(
             parser(r"\x{26c4}").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..8),
-                kind: AstLiteralKind::HexBrace(AstHexLiteralKind::X),
+                kind: ast::LiteralKind::HexBrace(ast::HexLiteralKind::X),
                 c: '⛄',
             })));
         assert_eq!(
             parser(r"\x{26C4}").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..8),
-                kind: AstLiteralKind::HexBrace(AstHexLiteralKind::X),
+                kind: ast::LiteralKind::HexBrace(ast::HexLiteralKind::X),
                 c: '⛄',
             })));
         assert_eq!(
             parser(r"\x{10fFfF}").parse_escape(),
-            Ok(Primitive::Literal(AstLiteral {
+            Ok(Primitive::Literal(ast::Literal {
                 span: span(0..10),
-                kind: AstLiteralKind::HexBrace(AstHexLiteralKind::X),
+                kind: ast::LiteralKind::HexBrace(ast::HexLiteralKind::X),
                 c: '\u{10FFFF}',
             })));
 
-        assert_eq!(parser(r"\x").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x").parse_escape(), Err(ast::Error {
             span: span(2..2),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\x{").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{").parse_escape(), Err(ast::Error {
             span: span(2..3),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\x{FF").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{FF").parse_escape(), Err(ast::Error {
             span: span(2..5),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\x{}").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{}").parse_escape(), Err(ast::Error {
             span: span(2..4),
-            kind: AstErrorKind::EscapeHexEmpty,
+            kind: ast::ErrorKind::EscapeHexEmpty,
         }));
-        assert_eq!(parser(r"\x{FGF}").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{FGF}").parse_escape(), Err(ast::Error {
             span: span(4..5),
-            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+            kind: ast::ErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
-        assert_eq!(parser(r"\x{FFFFFF}").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{FFFFFF}").parse_escape(), Err(ast::Error {
             span: span(3..9),
-            kind: AstErrorKind::EscapeHexInvalid,
+            kind: ast::ErrorKind::EscapeHexInvalid,
         }));
-        assert_eq!(parser(r"\x{D800}").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{D800}").parse_escape(), Err(ast::Error {
             span: span(3..7),
-            kind: AstErrorKind::EscapeHexInvalid,
+            kind: ast::ErrorKind::EscapeHexInvalid,
         }));
-        assert_eq!(parser(r"\x{FFFFFFFFF}").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\x{FFFFFFFFF}").parse_escape(), Err(ast::Error {
             span: span(3..12),
-            kind: AstErrorKind::EscapeHexInvalid,
+            kind: ast::ErrorKind::EscapeHexInvalid,
         }));
     }
 
@@ -3542,17 +3611,17 @@ bar
         assert_eq!(parser("0").parse_decimal(), Ok(0));
         assert_eq!(parser("01").parse_decimal(), Ok(1));
 
-        assert_eq!(parser("-1").parse_decimal(), Err(AstError {
+        assert_eq!(parser("-1").parse_decimal(), Err(ast::Error {
             span: span(0..0),
-            kind: AstErrorKind::DecimalEmpty,
+            kind: ast::ErrorKind::DecimalEmpty,
         }));
-        assert_eq!(parser("").parse_decimal(), Err(AstError {
+        assert_eq!(parser("").parse_decimal(), Err(ast::Error {
             span: span(0..0),
-            kind: AstErrorKind::DecimalEmpty,
+            kind: ast::ErrorKind::DecimalEmpty,
         }));
-        assert_eq!(parser("9999999999").parse_decimal(), Err(AstError {
+        assert_eq!(parser("9999999999").parse_decimal(), Err(ast::Error {
             span: span(0..10),
-            kind: AstErrorKind::DecimalInvalid,
+            kind: ast::ErrorKind::DecimalInvalid,
         }));
     }
 
@@ -3561,17 +3630,17 @@ bar
         fn set(
             span: Span,
             negated: bool,
-            op: AstClassSetOp,
-        ) -> AstClass {
-            AstClass::Set(AstClassSet {
+            op: ast::ClassSetOp,
+        ) -> ast::Class {
+            ast::Class::Set(ast::ClassSet {
                 span: span,
                 negated: negated,
                 op: op,
             })
         }
 
-        fn union(span: Span, items: Vec<AstClassSetItem>) -> AstClassSetOp {
-            AstClassSetOp::Union(AstClassSetUnion {
+        fn union(span: Span, items: Vec<ast::ClassSetItem>) -> ast::ClassSetOp {
+            ast::ClassSetOp::Union(ast::ClassSetUnion {
                 span: span,
                 items: items,
             })
@@ -3579,12 +3648,12 @@ bar
 
         fn intersection(
             span: Span,
-            lhs: AstClassSetOp,
-            rhs: AstClassSetOp,
-        ) -> AstClassSetOp {
-            AstClassSetOp::BinaryOp(AstClassSetBinaryOp {
+            lhs: ast::ClassSetOp,
+            rhs: ast::ClassSetOp,
+        ) -> ast::ClassSetOp {
+            ast::ClassSetOp::BinaryOp(ast::ClassSetBinaryOp {
                 span: span,
-                kind: AstClassSetBinaryOpKind::Intersection,
+                kind: ast::ClassSetBinaryOpKind::Intersection,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             })
@@ -3592,12 +3661,12 @@ bar
 
         fn difference(
             span: Span,
-            lhs: AstClassSetOp,
-            rhs: AstClassSetOp,
-        ) -> AstClassSetOp {
-            AstClassSetOp::BinaryOp(AstClassSetBinaryOp {
+            lhs: ast::ClassSetOp,
+            rhs: ast::ClassSetOp,
+        ) -> ast::ClassSetOp {
+            ast::ClassSetOp::BinaryOp(ast::ClassSetBinaryOp {
                 span: span,
-                kind: AstClassSetBinaryOpKind::Difference,
+                kind: ast::ClassSetBinaryOpKind::Difference,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             })
@@ -3605,34 +3674,34 @@ bar
 
         fn symdifference(
             span: Span,
-            lhs: AstClassSetOp,
-            rhs: AstClassSetOp,
-        ) -> AstClassSetOp {
-            AstClassSetOp::BinaryOp(AstClassSetBinaryOp {
+            lhs: ast::ClassSetOp,
+            rhs: ast::ClassSetOp,
+        ) -> ast::ClassSetOp {
+            ast::ClassSetOp::BinaryOp(ast::ClassSetBinaryOp {
                 span: span,
-                kind: AstClassSetBinaryOpKind::SymmetricDifference,
+                kind: ast::ClassSetBinaryOpKind::SymmetricDifference,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             })
         }
 
-        fn item(cls: AstClass) -> AstClassSetItem {
-            AstClassSetItem::Class(Box::new(cls))
+        fn item(cls: ast::Class) -> ast::ClassSetItem {
+            ast::ClassSetItem::Class(Box::new(cls))
         }
 
-        fn item_ascii(cls: AstClassAscii) -> AstClassSetItem {
-            AstClassSetItem::Ascii(cls)
+        fn item_ascii(cls: ast::ClassAscii) -> ast::ClassSetItem {
+            ast::ClassSetItem::Ascii(cls)
         }
 
-        fn lit(span: Span, c: char) -> AstClassSetItem {
-            AstClassSetItem::Literal(AstLiteral {
+        fn lit(span: Span, c: char) -> ast::ClassSetItem {
+            ast::ClassSetItem::Literal(ast::Literal {
                 span: span,
-                kind: AstLiteralKind::Verbatim,
+                kind: ast::LiteralKind::Verbatim,
                 c: c,
             })
         }
 
-        fn range(span: Span, start: char, end: char) -> AstClassSetItem {
+        fn range(span: Span, start: char, end: char) -> ast::ClassSetItem {
             let pos1 = Position {
                 offset: span.start.offset + start.len_utf8(),
                 column: span.start.column + 1,
@@ -3643,39 +3712,39 @@ bar
                 column: span.end.column - 1,
                 ..span.end
             };
-            AstClassSetItem::Range(AstClassSetRange {
+            ast::ClassSetItem::Range(ast::ClassSetRange {
                 span: span,
-                start: AstLiteral {
+                start: ast::Literal {
                     span: Span { end: pos1, ..span },
-                    kind: AstLiteralKind::Verbatim,
+                    kind: ast::LiteralKind::Verbatim,
                     c: start,
                 },
-                end: AstLiteral {
+                end: ast::Literal {
                     span: Span { start: pos2, ..span },
-                    kind: AstLiteralKind::Verbatim,
+                    kind: ast::LiteralKind::Verbatim,
                     c: end,
                 },
             })
         }
 
-        fn alnum(span: Span, negated: bool) -> AstClassAscii {
-            AstClassAscii {
+        fn alnum(span: Span, negated: bool) -> ast::ClassAscii {
+            ast::ClassAscii {
                 span: span,
-                kind: AstClassAsciiKind::Alnum,
+                kind: ast::ClassAsciiKind::Alnum,
                 negated: negated,
             }
         }
 
         /*
-        fn alnum(span: Span, negated: bool) -> AstClass {
-            AstClass::Set(AstClassSet {
+        fn alnum(span: Span, negated: bool) -> ast::Class {
+            ast::Class::Set(ast::ClassSet {
                 span: span,
                 negated: negated,
-                op: AstClassSetOp::Union(AstClassSetUnion {
+                op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                     span: span,
-                    items: vec![AstClassSetItem::Ascii(AstClassAscii {
+                    items: vec![ast::ClassSetItem::Ascii(ast::ClassAscii {
                         span: span,
-                        kind: AstClassAsciiKind::Alnum,
+                        kind: ast::ClassAsciiKind::Alnum,
                         negated: negated,
                     })],
                 }),
@@ -3683,17 +3752,17 @@ bar
         }
         */
 
-        fn lower(span: Span, negated: bool) -> AstClassAscii {
-            AstClassAscii {
+        fn lower(span: Span, negated: bool) -> ast::ClassAscii {
+            ast::ClassAscii {
                 span: span,
-                kind: AstClassAsciiKind::Lower,
+                kind: ast::ClassAsciiKind::Lower,
                 negated: negated,
             }
         }
 
         assert_eq!(
             parser("[[:alnum:]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..11),
                 negated: false,
                 op: union(span(1..10), vec![
@@ -3702,11 +3771,11 @@ bar
             }))));
         assert_eq!(
             parser("[[[:alnum:]]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..13),
                 negated: false,
                 op: union(span(1..12), vec![
-                    item(AstClass::Set(AstClassSet {
+                    item(ast::Class::Set(ast::ClassSet {
                         span: span(1..12),
                         negated: false,
                         op: union(span(2..11), vec![
@@ -3717,7 +3786,7 @@ bar
             }))));
         assert_eq!(
             parser("[[:alnum:]&&[:lower:]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..22),
                 negated: false,
                 op: intersection(
@@ -3732,7 +3801,7 @@ bar
             }))));
         assert_eq!(
             parser("[[:alnum:]--[:lower:]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..22),
                 negated: false,
                 op: difference(
@@ -3747,7 +3816,7 @@ bar
             }))));
         assert_eq!(
             parser("[[:alnum:]~~[:lower:]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..22),
                 negated: false,
                 op: symdifference(
@@ -3763,35 +3832,35 @@ bar
 
         assert_eq!(
             parser("[a]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..3),
                 negated: false,
                 op: union(span(1..2), vec![lit(span(1..2), 'a')]),
             }))));
         assert_eq!(
             parser(r"[a\]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..5),
                 negated: false,
                 op: union(span(1..4), vec![
                     lit(span(1..2), 'a'),
-                    AstClassSetItem::Literal(AstLiteral {
+                    ast::ClassSetItem::Literal(ast::Literal {
                         span: span(2..4),
-                        kind: AstLiteralKind::Punctuation,
+                        kind: ast::LiteralKind::Punctuation,
                         c: ']',
                     }),
                 ]),
             }))));
         assert_eq!(
             parser(r"[a\-z]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..6),
                 negated: false,
                 op: union(span(1..5), vec![
                     lit(span(1..2), 'a'),
-                    AstClassSetItem::Literal(AstLiteral {
+                    ast::ClassSetItem::Literal(ast::Literal {
                         span: span(2..4),
-                        kind: AstLiteralKind::Punctuation,
+                        kind: ast::LiteralKind::Punctuation,
                         c: '-',
                     }),
                     lit(span(4..5), 'z'),
@@ -3799,7 +3868,7 @@ bar
             }))));
         assert_eq!(
             parser("[ab]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..4),
                 negated: false,
                 op: union(span(1..3), vec![
@@ -3809,7 +3878,7 @@ bar
             }))));
         assert_eq!(
             parser("[a-]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..4),
                 negated: false,
                 op: union(span(1..3), vec![
@@ -3819,7 +3888,7 @@ bar
             }))));
         assert_eq!(
             parser("[-a]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..4),
                 negated: false,
                 op: union(span(1..3), vec![
@@ -3829,40 +3898,40 @@ bar
             }))));
         assert_eq!(
             parser(r"[\pL]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..5),
                 negated: false,
                 op: union(span(1..4), vec![
-                    item(AstClass::Unicode(AstClassUnicode {
+                    item(ast::Class::Unicode(ast::ClassUnicode {
                         span: span(1..4),
                         negated: false,
-                        kind: AstClassUnicodeKind::OneLetter('L'),
+                        kind: ast::ClassUnicodeKind::OneLetter('L'),
                     })),
                 ]),
             }))));
         assert_eq!(
             parser(r"[\w]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..4),
                 negated: false,
                 op: union(span(1..3), vec![
-                    item(AstClass::Perl(AstClassPerl {
+                    item(ast::Class::Perl(ast::ClassPerl {
                         span: span(1..3),
-                        kind: AstClassPerlKind::Word,
+                        kind: ast::ClassPerlKind::Word,
                         negated: false,
                     })),
                 ]),
             }))));
         assert_eq!(
             parser(r"[a\wz]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..6),
                 negated: false,
                 op: union(span(1..5), vec![
                     lit(span(1..2), 'a'),
-                    item(AstClass::Perl(AstClassPerl {
+                    item(ast::Class::Perl(ast::ClassPerl {
                         span: span(2..4),
-                        kind: AstClassPerlKind::Word,
+                        kind: ast::ClassPerlKind::Word,
                         negated: false,
                     })),
                     lit(span(4..5), 'z'),
@@ -3871,7 +3940,7 @@ bar
 
         assert_eq!(
             parser("[a-z]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..5),
                 negated: false,
                 op: union(span(1..4), vec![
@@ -3880,7 +3949,7 @@ bar
             }))));
         assert_eq!(
             parser("[a-cx-z]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..8),
                 negated: false,
                 op: union(span(1..7), vec![
@@ -3890,15 +3959,15 @@ bar
             }))));
         assert_eq!(
             parser(r"[\w&&a-cx-z]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..12),
                 negated: false,
                 op: intersection(
                     span(1..11),
                     union(span(1..3), vec![
-                        item(AstClass::Perl(AstClassPerl {
+                        item(ast::Class::Perl(ast::ClassPerl {
                             span: span(1..3),
-                            kind: AstClassPerlKind::Word,
+                            kind: ast::ClassPerlKind::Word,
                             negated: false,
                         })),
                     ]),
@@ -3910,7 +3979,7 @@ bar
             }))));
         assert_eq!(
             parser(r"[a-cx-z&&\w]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..12),
                 negated: false,
                 op: intersection(
@@ -3920,9 +3989,9 @@ bar
                         range(span(4..7), 'x', 'z'),
                     ]),
                     union(span(9..11), vec![
-                        item(AstClass::Perl(AstClassPerl {
+                        item(ast::Class::Perl(ast::ClassPerl {
                             span: span(9..11),
-                            kind: AstClassPerlKind::Word,
+                            kind: ast::ClassPerlKind::Word,
                             negated: false,
                         })),
                     ]),
@@ -3930,7 +3999,7 @@ bar
             }))));
         assert_eq!(
             parser(r"[a--b--c]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..9),
                 negated: false,
                 op: difference(
@@ -3945,7 +4014,7 @@ bar
             }))));
         assert_eq!(
             parser(r"[a~~b~~c]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..9),
                 negated: false,
                 op: symdifference(
@@ -3960,15 +4029,15 @@ bar
             }))));
         assert_eq!(
             parser(r"[\^&&^]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..7),
                 negated: false,
                 op: intersection(
                     span(1..6),
                     union(span(1..3), vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(1..3),
-                            kind: AstLiteralKind::Punctuation,
+                            kind: ast::LiteralKind::Punctuation,
                             c: '^',
                         }),
                     ]),
@@ -3979,15 +4048,15 @@ bar
             }))));
         assert_eq!(
             parser(r"[\&&&&]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..7),
                 negated: false,
                 op: intersection(
                     span(1..6),
                     union(span(1..3), vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(1..3),
-                            kind: AstLiteralKind::Punctuation,
+                            kind: ast::LiteralKind::Punctuation,
                             c: '&',
                         }),
                     ]),
@@ -3998,7 +4067,7 @@ bar
             }))));
         assert_eq!(
             parser(r"[&&&&]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..6),
                 negated: false,
                 op: intersection(
@@ -4015,20 +4084,20 @@ bar
         let pat = "[☃-⛄]";
         assert_eq!(
             parser(pat).parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span_range(pat, 0..9),
                 negated: false,
                 op: union(span_range(pat, 1..8), vec![
-                    AstClassSetItem::Range(AstClassSetRange {
+                    ast::ClassSetItem::Range(ast::ClassSetRange {
                         span: span_range(pat, 1..8),
-                        start: AstLiteral {
+                        start: ast::Literal {
                             span: span_range(pat, 1..4),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '☃',
                         },
-                        end: AstLiteral {
+                        end: ast::Literal {
                             span: span_range(pat, 5..8),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '⛄',
                         },
                     }),
@@ -4037,21 +4106,21 @@ bar
 
         assert_eq!(
             parser(r"[]]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..3),
                 negated: false,
                 op: union(span(1..2), vec![lit(span(1..2), ']')]),
             }))));
         assert_eq!(
             parser(r"[]\[]").parse(),
-            Ok(Ast::Class(AstClass::Set(AstClassSet {
+            Ok(Ast::Class(ast::Class::Set(ast::ClassSet {
                 span: span(0..5),
                 negated: false,
                 op: union(span(1..4), vec![
                     lit(span(1..2), ']'),
-                    AstClassSetItem::Literal(AstLiteral  {
+                    ast::ClassSetItem::Literal(ast::Literal  {
                         span: span(2..4),
-                        kind: AstLiteralKind::Punctuation,
+                        kind: ast::LiteralKind::Punctuation,
                         c: '[',
                     }),
                 ]),
@@ -4059,78 +4128,78 @@ bar
         assert_eq!(
             parser(r"[\[]]").parse(),
             Ok(concat(0..5, vec![
-                Ast::Class(AstClass::Set(AstClassSet {
+                Ast::Class(ast::Class::Set(ast::ClassSet {
                     span: span(0..4),
                     negated: false,
                     op: union(span(1..3), vec![
-                        AstClassSetItem::Literal(AstLiteral  {
+                        ast::ClassSetItem::Literal(ast::Literal  {
                             span: span(1..3),
-                            kind: AstLiteralKind::Punctuation,
+                            kind: ast::LiteralKind::Punctuation,
                             c: '[',
                         }),
                     ]),
                 })),
-                Ast::Literal(AstLiteral {
+                Ast::Literal(ast::Literal {
                     span: span(4..5),
-                    kind: AstLiteralKind::Verbatim,
+                    kind: ast::LiteralKind::Verbatim,
                     c: ']',
                 }),
             ])));
 
         assert_eq!(
             parser("[").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[[").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..2),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[[-]").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[[[:alnum:]").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..2),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser(r"[\b]").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..3),
-                kind: AstErrorKind::ClassIllegal,
+                kind: ast::ErrorKind::ClassIllegal,
             }));
         assert_eq!(
             parser(r"[\w-a]").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(1..3),
-                kind: AstErrorKind::ClassIllegal,
+                kind: ast::ErrorKind::ClassIllegal,
             }));
         assert_eq!(
             parser(r"[a-\w]").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(3..5),
-                kind: AstErrorKind::ClassIllegal,
+                kind: ast::ErrorKind::ClassIllegal,
             }));
 
         assert_eq!(
             parser_ignore_space("[a ").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser_ignore_space("[a- ").parse(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
     }
 
@@ -4138,15 +4207,15 @@ bar
     fn parse_set_class_open() {
         assert_eq!(
             parser("[a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..1),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(1..1),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(1..1),
                     items: vec![],
                 };
@@ -4154,15 +4223,15 @@ bar
             });
         assert_eq!(
             parser_ignore_space("[   a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..4),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(4..4),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(4..4),
                     items: vec![],
                 };
@@ -4170,15 +4239,15 @@ bar
             });
         assert_eq!(
             parser("[^a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..2),
                     negated: true,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(2..2),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(2..2),
                     items: vec![],
                 };
@@ -4186,15 +4255,15 @@ bar
             });
         assert_eq!(
             parser_ignore_space("[ ^ a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..4),
                     negated: true,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(4..4),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(4..4),
                     items: vec![],
                 };
@@ -4202,20 +4271,20 @@ bar
             });
         assert_eq!(
             parser("[-a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..2),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(1..1),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(1..2),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(1..2),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '-',
                         }),
                     ],
@@ -4224,20 +4293,20 @@ bar
             });
         assert_eq!(
             parser_ignore_space("[ - a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..4),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(2..2),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(2..3),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(2..3),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '-',
                         }),
                     ],
@@ -4246,20 +4315,20 @@ bar
             });
         assert_eq!(
             parser("[^-a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..3),
                     negated: true,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(2..2),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(2..3),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(2..3),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '-',
                         }),
                     ],
@@ -4268,25 +4337,25 @@ bar
             });
         assert_eq!(
             parser("[--a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..3),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(1..1),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(1..3),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(1..2),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '-',
                         }),
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(2..3),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '-',
                         }),
                     ],
@@ -4295,20 +4364,20 @@ bar
             });
         assert_eq!(
             parser("[]a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..2),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(1..1),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(1..2),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(1..2),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: ']',
                         }),
                     ],
@@ -4317,20 +4386,20 @@ bar
             });
         assert_eq!(
             parser_ignore_space("[ ] a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..4),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(2..2),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(2..3),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(2..3),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: ']',
                         }),
                     ],
@@ -4339,20 +4408,20 @@ bar
             });
         assert_eq!(
             parser("[^]a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..3),
                     negated: true,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(2..2),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(2..3),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(2..3),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: ']',
                         }),
                     ],
@@ -4361,20 +4430,20 @@ bar
             });
         assert_eq!(
             parser("[-]a]").parse_set_class_open(), {
-                let set = AstClassSet {
+                let set = ast::ClassSet {
                     span: span(0..2),
                     negated: false,
-                    op: AstClassSetOp::Union(AstClassSetUnion {
+                    op: ast::ClassSetOp::Union(ast::ClassSetUnion {
                         span: span(1..1),
                         items: vec![],
                     }),
                 };
-                let union = AstClassSetUnion {
+                let union = ast::ClassSetUnion {
                     span: span(1..2),
                     items: vec![
-                        AstClassSetItem::Literal(AstLiteral {
+                        ast::ClassSetItem::Literal(ast::Literal {
                             span: span(1..2),
-                            kind: AstLiteralKind::Verbatim,
+                            kind: ast::LiteralKind::Verbatim,
                             c: '-',
                         }),
                     ],
@@ -4384,39 +4453,39 @@ bar
 
         assert_eq!(
             parser("[").parse_set_class_open(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..1),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser_ignore_space("[    ").parse_set_class_open(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..5),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[^").parse_set_class_open(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..2),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[]").parse_set_class_open(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..2),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[-").parse_set_class_open(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..2),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
         assert_eq!(
             parser("[--").parse_set_class_open(),
-            Err(AstError {
+            Err(ast::Error {
                 span: span(0..3),
-                kind: AstErrorKind::ClassUnclosed,
+                kind: ast::ErrorKind::ClassUnclosed,
             }));
     }
 
@@ -4424,23 +4493,23 @@ bar
     fn maybe_parse_ascii_class() {
         assert_eq!(
             parser(r"[:alnum:]").maybe_parse_ascii_class(),
-            Some(AstClassAscii {
+            Some(ast::ClassAscii {
                 span: span(0..9),
-                kind: AstClassAsciiKind::Alnum,
+                kind: ast::ClassAsciiKind::Alnum,
                 negated: false,
             }));
         assert_eq!(
             parser(r"[:alnum:]A").maybe_parse_ascii_class(),
-            Some(AstClassAscii {
+            Some(ast::ClassAscii {
                 span: span(0..9),
-                kind: AstClassAsciiKind::Alnum,
+                kind: ast::ClassAsciiKind::Alnum,
                 negated: false,
             }));
         assert_eq!(
             parser(r"[:^alnum:]").maybe_parse_ascii_class(),
-            Some(AstClassAscii {
+            Some(ast::ClassAscii {
                 span: span(0..10),
-                kind: AstClassAsciiKind::Alnum,
+                kind: ast::ClassAsciiKind::Alnum,
                 negated: true,
             }));
 
@@ -4473,69 +4542,69 @@ bar
     fn parse_unicode_class() {
         assert_eq!(
             parser(r"\pN").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..3),
                 negated: false,
-                kind: AstClassUnicodeKind::OneLetter('N'),
+                kind: ast::ClassUnicodeKind::OneLetter('N'),
             })));
         assert_eq!(
             parser(r"\PN").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..3),
                 negated: true,
-                kind: AstClassUnicodeKind::OneLetter('N'),
+                kind: ast::ClassUnicodeKind::OneLetter('N'),
             })));
         assert_eq!(
             parser(r"\p{N}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..5),
                 negated: false,
-                kind: AstClassUnicodeKind::Named(s("N")),
+                kind: ast::ClassUnicodeKind::Named(s("N")),
             })));
         assert_eq!(
             parser(r"\P{N}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..5),
                 negated: true,
-                kind: AstClassUnicodeKind::Named(s("N")),
+                kind: ast::ClassUnicodeKind::Named(s("N")),
             })));
         assert_eq!(
             parser(r"\p{Greek}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..9),
                 negated: false,
-                kind: AstClassUnicodeKind::Named(s("Greek")),
+                kind: ast::ClassUnicodeKind::Named(s("Greek")),
             })));
 
         assert_eq!(
             parser(r"\p{scx:Katakana}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..16),
                 negated: false,
-                kind: AstClassUnicodeKind::NamedValue {
-                    op: AstClassUnicodeOpKind::Colon,
+                kind: ast::ClassUnicodeKind::NamedValue {
+                    op: ast::ClassUnicodeOpKind::Colon,
                     name: s("scx"),
                     value: s("Katakana"),
                 },
             })));
         assert_eq!(
             parser(r"\p{scx=Katakana}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..16),
                 negated: false,
-                kind: AstClassUnicodeKind::NamedValue {
-                    op: AstClassUnicodeOpKind::Equal,
+                kind: ast::ClassUnicodeKind::NamedValue {
+                    op: ast::ClassUnicodeOpKind::Equal,
                     name: s("scx"),
                     value: s("Katakana"),
                 },
             })));
         assert_eq!(
             parser(r"\p{scx!=Katakana}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..17),
                 negated: false,
-                kind: AstClassUnicodeKind::NamedValue {
-                    op: AstClassUnicodeOpKind::NotEqual,
+                kind: ast::ClassUnicodeKind::NamedValue {
+                    op: ast::ClassUnicodeOpKind::NotEqual,
                     name: s("scx"),
                     value: s("Katakana"),
                 },
@@ -4543,85 +4612,85 @@ bar
 
         assert_eq!(
             parser(r"\p{:}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..5),
                 negated: false,
-                kind: AstClassUnicodeKind::NamedValue {
-                    op: AstClassUnicodeOpKind::Colon,
+                kind: ast::ClassUnicodeKind::NamedValue {
+                    op: ast::ClassUnicodeOpKind::Colon,
                     name: s(""),
                     value: s(""),
                 },
             })));
         assert_eq!(
             parser(r"\p{=}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..5),
                 negated: false,
-                kind: AstClassUnicodeKind::NamedValue {
-                    op: AstClassUnicodeOpKind::Equal,
+                kind: ast::ClassUnicodeKind::NamedValue {
+                    op: ast::ClassUnicodeOpKind::Equal,
                     name: s(""),
                     value: s(""),
                 },
             })));
         assert_eq!(
             parser(r"\p{!=}").parse_escape(),
-            Ok(Primitive::Unicode(AstClassUnicode {
+            Ok(Primitive::Unicode(ast::ClassUnicode {
                 span: span(0..6),
                 negated: false,
-                kind: AstClassUnicodeKind::NamedValue {
-                    op: AstClassUnicodeOpKind::NotEqual,
+                kind: ast::ClassUnicodeKind::NamedValue {
+                    op: ast::ClassUnicodeOpKind::NotEqual,
                     name: s(""),
                     value: s(""),
                 },
             })));
 
-        assert_eq!(parser(r"\p").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\p").parse_escape(), Err(ast::Error {
             span: span(2..2),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\p{").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\p{").parse_escape(), Err(ast::Error {
             span: span(3..3),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\p{N").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\p{N").parse_escape(), Err(ast::Error {
             span: span(4..4),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
-        assert_eq!(parser(r"\p{Greek").parse_escape(), Err(AstError {
+        assert_eq!(parser(r"\p{Greek").parse_escape(), Err(ast::Error {
             span: span(8..8),
-            kind: AstErrorKind::EscapeUnexpectedEof,
+            kind: ast::ErrorKind::EscapeUnexpectedEof,
         }));
 
         assert_eq!(
             parser(r"\pNz").parse(),
-            Ok(Ast::Concat(AstConcat {
+            Ok(Ast::Concat(ast::Concat {
                 span: span(0..4),
                 asts: vec![
-                    Ast::Class(AstClass::Unicode(AstClassUnicode {
+                    Ast::Class(ast::Class::Unicode(ast::ClassUnicode {
                         span: span(0..3),
                         negated: false,
-                        kind: AstClassUnicodeKind::OneLetter('N'),
+                        kind: ast::ClassUnicodeKind::OneLetter('N'),
                     })),
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(3..4),
-                        kind: AstLiteralKind::Verbatim,
+                        kind: ast::LiteralKind::Verbatim,
                         c: 'z',
                     }),
                 ],
             })));
         assert_eq!(
             parser(r"\p{Greek}z").parse(),
-            Ok(Ast::Concat(AstConcat {
+            Ok(Ast::Concat(ast::Concat {
                 span: span(0..10),
                 asts: vec![
-                    Ast::Class(AstClass::Unicode(AstClassUnicode {
+                    Ast::Class(ast::Class::Unicode(ast::ClassUnicode {
                         span: span(0..9),
                         negated: false,
-                        kind: AstClassUnicodeKind::Named(s("Greek")),
+                        kind: ast::ClassUnicodeKind::Named(s("Greek")),
                     })),
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(9..10),
-                        kind: AstLiteralKind::Verbatim,
+                        kind: ast::LiteralKind::Verbatim,
                         c: 'z',
                     }),
                 ],
@@ -4632,67 +4701,67 @@ bar
     fn parse_perl_class() {
         assert_eq!(
             parser(r"\d").parse_escape(),
-            Ok(Primitive::Perl(AstClassPerl {
+            Ok(Primitive::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Digit,
+                kind: ast::ClassPerlKind::Digit,
                 negated: false,
             })));
         assert_eq!(
             parser(r"\D").parse_escape(),
-            Ok(Primitive::Perl(AstClassPerl {
+            Ok(Primitive::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Digit,
+                kind: ast::ClassPerlKind::Digit,
                 negated: true,
             })));
         assert_eq!(
             parser(r"\s").parse_escape(),
-            Ok(Primitive::Perl(AstClassPerl {
+            Ok(Primitive::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Space,
+                kind: ast::ClassPerlKind::Space,
                 negated: false,
             })));
         assert_eq!(
             parser(r"\S").parse_escape(),
-            Ok(Primitive::Perl(AstClassPerl {
+            Ok(Primitive::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Space,
+                kind: ast::ClassPerlKind::Space,
                 negated: true,
             })));
         assert_eq!(
             parser(r"\w").parse_escape(),
-            Ok(Primitive::Perl(AstClassPerl {
+            Ok(Primitive::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Word,
+                kind: ast::ClassPerlKind::Word,
                 negated: false,
             })));
         assert_eq!(
             parser(r"\W").parse_escape(),
-            Ok(Primitive::Perl(AstClassPerl {
+            Ok(Primitive::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Word,
+                kind: ast::ClassPerlKind::Word,
                 negated: true,
             })));
 
         assert_eq!(
             parser(r"\d").parse(),
-            Ok(Ast::Class(AstClass::Perl(AstClassPerl {
+            Ok(Ast::Class(ast::Class::Perl(ast::ClassPerl {
                 span: span(0..2),
-                kind: AstClassPerlKind::Digit,
+                kind: ast::ClassPerlKind::Digit,
                 negated: false,
             }))));
         assert_eq!(
             parser(r"\dz").parse(),
-            Ok(Ast::Concat(AstConcat {
+            Ok(Ast::Concat(ast::Concat {
                 span: span(0..3),
                 asts: vec![
-                    Ast::Class(AstClass::Perl(AstClassPerl {
+                    Ast::Class(ast::Class::Perl(ast::ClassPerl {
                         span: span(0..2),
-                        kind: AstClassPerlKind::Digit,
+                        kind: ast::ClassPerlKind::Digit,
                         negated: false,
                     })),
-                    Ast::Literal(AstLiteral {
+                    Ast::Literal(ast::Literal {
                         span: span(2..3),
-                        kind: AstLiteralKind::Verbatim,
+                        kind: ast::LiteralKind::Verbatim,
                         c: 'z',
                     }),
                 ],

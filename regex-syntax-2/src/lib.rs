@@ -16,7 +16,12 @@ TODO.
 */
 
 pub use parse::*;
+pub use translate::*;
 
 /// This module defines a regular expression abstract syntax.
 pub mod ast;
+#[allow(missing_docs)]
+pub mod hir;
 mod parse;
+#[allow(missing_docs)]
+mod translate;
